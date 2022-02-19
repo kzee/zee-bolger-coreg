@@ -1,0 +1,2500 @@
+---
+title: "Code for *Physiological Coregulation during Social Support Discussions* (Zee & Bolger, in press, *Emotion*)"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+editor_options: 
+  chunk_output_type: console
+---
+
+*Last updated `r Sys.Date()`*
+
+
+# Overview
+
+This file shows code accompanying the paper *Physiological Coregulation during Social Support Discussions* by Katherine Zee and Niall Bolger. 
+
+The code is meant to be run with the accompanying deidentified dataset. Due to the dyadic structure of the data, some variables have been omitted from this publicly posted version of the dataset to protect participants' privacy (e.g., data about sexual orientation and health are not provided in the publicly posted dataset). 
+
+Because of the complexity of our design and models (dyadic multilevel models fit with Bayesian estimation), **the models specified in this code will likely take a long time (~18 hours) to run**. The model code and output is provided so you can see the results for yourself. 
+
+The primary model object for this paper has already been generated (see [this section](#load-rds-file-containing-the-model-object)). You do not have to run the full model yourself, you only need to load the `.rds` file provided (as indicated in the code). We provide code for the remaining models. If you wish to run any of the models yourself, we recommend that you save the resulting model object as a `.rds` file so you can access the model object during future R sessions without having to run the model again. 
+
+
+```{r, include = F}
+knitr::opts_chunk$set(echo = T, warning = T, message = T, cache = T)
+```
+
+# Load Libraries
+```{r ch3-libload, cache = F, message = F, warning = F, results="hide"}
+
+library(deSolve)  #for the differential equation solvers
+library(ggplot2)   #for plotting
+library(zoo)       #for making time-series embedded data
+library(reshape2)  #for reshaping data
+library(car)
+library(brms) # for fitting bayesian models
+library(broom)
+library(psych)
+library(tidyverse)
+library(depmixS4) # for latent profile analysis
+library(data.table)
+```
+
+# Define Functions
+
+## Round to 3 Decimal Places
+
+```{r roundto3fun}
+
+## For rounding values to 3 digits
+
+roundto3 <- function(x) {
+  (ifelse(abs(x) < .01, 
+                 format(round(x, 3), nsmall = 3),
+                 format(round(x, 2), nsmall = 2)))
+}
+
+```
+
+## Table for Output
+- Creates a table from a brms model object, with 95% credibility intervals and posterior probabilities
+
+```{r coregpaper_functions}
+
+
+blm_table <- function(x) {
+  
+  library(broom)
+  require(stringr)
+  require(brms)
+  modtidy <- as.data.frame(fixef(x))
+  modtidy$term <- row.names(modtidy)
+  modtidy$var <- colnames(x$data)[1]
+
+  modtidy$Estimate_raw <- as.numeric(modtidy$Estimate)
+  modtidy$Estimate <- ifelse(abs(modtidy$Estimate) < .01, format(round(modtidy$Estimate, 3), nsmall = 3),
+                             format(round(modtidy$Estimate, 2), nsmall = 2))
+  
+  modtidy$SE <- ifelse(abs(modtidy$Est.Error) < .01, format(round(modtidy$Est.Error, 3), nsmall = 3),
+                       format(round(modtidy$Est.Error, 2), nsmall =2))
+  
+  modtidy$Lower <- ifelse(abs(modtidy$Q2.5) < .01, format(round(modtidy$Q2.5, 3), nsmall = 3), 
+                          format(round(modtidy$Q2.5, 2), nsmall = 2))
+  
+  
+  modtidy$Upper <- ifelse(abs(modtidy$Q97.5) < .01, format(round(modtidy$Q97.5, 3), nsmall = 3), 
+                          format(round(modtidy$Q97.5, 2), nsmall = 2))
+  
+
+  modtidy$N_Dyad <- ifelse( length(unique(x$data$dyad)) == 0, nrow(x$data), length(unique(x$data$dyad)))
+  modtidy$N_Obs <- nobs(x)
+
+  
+  modtidy$hyp <- paste(modtidy$term, "<", "0", sep = " ")
+  
+  
+
+  modtidy$Post_Probfull <- hypothesis(x, modtidy$hyp)$hypothesis$Post.Prob
+
+  modtidy$Post_Prob <- noquote(format(round(modtidy$Post_Probfull, 2), nsmall = 2))
+  
+  modtidy <- dplyr::select(modtidy, var, term, Estimate, SE, Lower, Upper, Post_Prob, N_Dyad, N_Obs)
+  
+  row.names(modtidy) <- c()
+  return(modtidy)
+  
+}
+```
+
+
+## Coupled Ode Function 
+
+- Code for generating predictions from coupled damped oscillator model, given coefficients and starting values. Drawn from Emily Butler's `rties` source code.
+
+```{r clofunction}
+
+cloCoupledOde <- function(t, state, parameters)
+{
+  with(as.list(c(state, parameters)), {
+    dy1 <- y2
+    dy2 <- y1*obs_0 + y2*d1_0 + y3*p_obs_0 + y4*p_d1_0
+    dy3 <- y4
+    dy4 <- y3*obs_1 + y4*d1_1 + y1*p_obs_1 + y2*p_d1_1
+    list(c(dy1, dy2, dy3, dy4))		
+  })
+}
+```
+
+
+
+# Description of Variables
+- `dyad` = Dyad level id (note: this is a new randomly generated id number to preserve dyad-level anonymity)
+- `partner` = Suffix was determined by room assignment. In heterosexual couples, `A` is always the female partner and `B` is always the male partner.
+- `id` = Partner level id, a combination of the dyad id and the partner suffix (A or B). 
+- `phase` = Discussion. `goal` = the control discussion, `femalereceive` = support discussion in which female partner (`A`) received support, `malereceive` = support discussion in which male partner (`B`) received support. 
+- `time` = Variable indicating the time point of the observation. Values start at 31, as time intervals 1-30 correspond to a baseline resting period, values from which have already been filtered out of the dataset. The length of time between time points is 10 seconds.
+- `timephase` = Variable indicating the time point within each phase, starting from 1. There are 30 intervals per phase (5 minutes).
+- `timephase.r` = Same as above, but recoded to start at 0 instead of 1. 
+- `ibi.basec` = IBI value for this time point, centered on each person's baseline. Units are miliseconds. Values can be positive or negative, as they capture deviations from baseline IBI on a 10 second basis. 
+- `b.ibi.basec` = IBI value for this time point for the *partner*, centered on the partner's baseline.
+
+
+# Read in Data
+
+```{r}
+kz <- read.csv("zee_bolger_coreg_data_deid.csv")
+```
+
+
+## Missing data analysis (based on dyad as unit of analysis)
+
+```{r}
+
+observations <- kz %>% 
+  
+  # code whether observation is missing
+  mutate(
+    is_missing = ifelse(is.na(ibi.basec) == T, 1, 0)
+  
+  # count up number of missing observations per dyad    
+  ) %>% group_by(dyad) %>% 
+  summarise(
+    num_missing = sum(is_missing)
+  )
+
+
+# Average number of missing observations per dyad:
+summary(observations$num_missing)
+
+obs_table_perc <- table(observations$num_missing)/sum(table(observations$num_missing))
+
+# percentage of dyads with no missing data
+obs_table_perc["0"] 
+
+```
+
+
+# Differeniate the Data
+
+## GLLA
+
+```{r glla}
+
+# Use function and adapt code from QuantDev website: 
+# https://quantdev.ssri.psu.edu/tutorials/apa-ati-intensive-longitudinal-data-session-v-diff-eq-models
+
+### NOTE!!! stats::lag and dplyr::lag end up doing slightly different things. 
+## need to use stats::lag here
+
+GLLA <- function(x, embed, tau, deltaT, order=2) {
+        L <- rep(1,embed)
+        for(i in 1:order) {
+            L <- cbind(L,(((c(1:embed)-mean(1:embed))*tau*deltaT)^i)/factorial(i))
+            }
+        
+        W <- solve(t(L)%*%L)%*%t(L)
+        #EMat <- Embed(x,embed,1)
+        #replacement for Embed for embed = 5
+          xzoo <- zoo(x)
+      xzooembed <- cbind(stats::lag(xzoo,k=-2), stats::lag(xzoo,k=-1), xzoo, stats::lag(xzoo,k=1), stats::lag(xzoo,k=2))
+      EMat <- as.matrix(xzooembed)
+    #Continuation
+        Estimates <- EMat%*%(t(W))
+
+        return(Estimates)
+        }
+```
+
+## Generate a list of unique dyad ids
+
+```{r uniqueids}
+idlist_kz <- unique(kz$id)
+```
+
+## Derivatives for control (goal) discussion phase
+
+```{r gllagoal}
+
+derivdf_kz_goal <- data.frame()
+
+    for(i in idlist_kz){
+      #i <- "101.A" # for testing
+        curr_data = subset(kz, id == i & phase == "goal")
+        derivs_x = as.data.frame(GLLA(x = curr_data$ibi.basec, 
+                        embed = 5, tau = 1, deltaT = 1, order = 2))
+        derivs_x$id <- i
+        derivs_x$timephase <- as.numeric(row.names(derivs_x))
+        
+        derivs_x$phase <- "goal"
+        
+        derivs_b.x = as.data.frame(GLLA(x = curr_data$b.ibi.basec, 
+                          embed = 5, tau = 1, deltaT = 1, order = 2))
+        derivs_b.x$b.timephase <- row.names(derivs_b.x)
+        
+        
+
+        
+        colnames(derivs_x) = c('x_est', 'dx_est', 'd2x_est', 'id', 'timephase', 'phase')
+        colnames(derivs_b.x) = c('b.x_est', 'b.dx_est', 'b.d2x_est',
+                                 'b.timephase')
+
+        derivs_plus = cbind(derivs_x, derivs_b.x)
+       # return(derivs_plus2)
+   derivdf_kz_goal <- rbind(derivdf_kz_goal, derivs_plus)
+    }
+
+
+
+```
+
+
+## Derivatives for female receive support
+
+```{r gllafemalereceive}
+
+
+derivdf_kz_fr <- data.frame()
+
+    for(i in idlist_kz){
+      #i <- "101.A" # for testing
+        curr_data = subset(kz, id == i & phase == "femalereceive")
+        derivs_x = as.data.frame(GLLA(x = curr_data$ibi.basec, 
+                        embed = 5, tau = 1, deltaT = 1, order = 2))
+        derivs_x$id <- i
+        derivs_x$timephase <- as.numeric(row.names(derivs_x))
+        
+        derivs_x$phase <- "femalereceive"
+
+        
+        derivs_b.x = as.data.frame(GLLA(x = curr_data$b.ibi.basec, 
+                          embed = 5, tau = 1, deltaT = 1, order = 2))
+        derivs_b.x$b.timephase <- row.names(derivs_b.x)
+
+        
+        colnames(derivs_x) = c('x_est', 'dx_est', 'd2x_est', 'id', 'timephase', 'phase')
+        colnames(derivs_b.x) = c('b.x_est', 'b.dx_est', 'b.d2x_est',
+                                 'b.timephase')
+
+        derivs_plus = cbind(derivs_x, derivs_b.x)
+       # return(derivs_plus2)
+   derivdf_kz_fr <- rbind(derivdf_kz_fr, derivs_plus)
+    }
+
+
+
+```
+
+## Derivatives for male receive support
+
+```{r gllamalereceive}
+
+derivdf_kz_fp <- data.frame()
+
+    for(i in idlist_kz){
+      #i <- "101.A" # for testing
+        curr_data = subset(kz, id == i & phase == "malereceive")
+        derivs_x = as.data.frame(GLLA(x = curr_data$ibi.basec, 
+                        embed = 5, tau = 1, deltaT = 1, order = 2))
+        derivs_x$id <- i
+        derivs_x$timephase <- as.numeric(row.names(derivs_x))
+        
+        derivs_x$phase <- "malereceive"
+
+        
+        derivs_b.x = as.data.frame(GLLA(x = curr_data$b.ibi.basec, 
+                          embed = 5, tau = 1, deltaT = 1, order = 2))
+        derivs_b.x$b.timephase <- as.numeric(row.names(derivs_b.x))
+
+        
+        colnames(derivs_x) = c('x_est', 'dx_est', 'd2x_est', 'id', 'timephase', 'phase')
+        colnames(derivs_b.x) = c('b.x_est', 'b.dx_est', 'b.d2x_est',
+                                 'b.timephase')
+
+        derivs_plus = cbind(derivs_x, derivs_b.x)
+       # return(derivs_plus2)
+   derivdf_kz_fp <- rbind(derivdf_kz_fp, derivs_plus)
+    }
+
+
+```
+
+## Aggregate derivatives data
+
+```{r aggderivs}
+
+# aggregate across phases
+dsmdata1 <- rbind(derivdf_kz_goal, derivdf_kz_fr, derivdf_kz_fp)
+
+# join to original dataset by id, timepoint, and phase
+# define effect coded and dummy variables
+dsmdata <- dplyr::full_join(dsmdata1, kz, 
+                            by = c('id', 'timephase', 'phase')) %>% 
+  mutate(
+    sup = ifelse(phase == "goal", -.5, .5),
+    
+    fr1 = ifelse(phase == "goal", 1, 0),
+    fr2 = ifelse(phase == "malereceive", 1, 0),
+    
+    goal1 = ifelse(phase == "femalereceive", 1, 0),
+    goal2 = ifelse(phase == "malereceive", 1, 0),
+    
+    mr1 = ifelse(phase == "goal", 1, 0),
+    mr2 = ifelse(phase == "femalereceive", 1, 0),
+    
+    f = ifelse(str_detect(id, ".A"), 1, 0)
+      )
+```
+
+
+# Primary Model Fitting
+
+## Subset Data
+
+- To use brms as a multivariate model (for the dyadic data structure), we need to subset the data so we have only one line per timepoint per dyad. 
+- We'll subset values where `f ==1` (indicating the female partner). Because the data are already set up to include both actor and partner columns, subsetting by the female partner will effectively give us one row per timepoint per *dyad.*
+- Variables without a prefix are for the female partner (e.g., `x_est`). Variables with the prefix `b.` are for the male partner (e.g., `b.x_est`). 
+
+```{r onelineperdyad}
+dsmdata_uns <- subset(dsmdata, f == 1)
+```
+
+## Define Formulas
+
+- Reference category is female receive support discussion
+- `fr1` = variable comparing female support (0) to control (1)
+- `fr2` = variable comparing female support (0) to male support (1)
+
+- `d2x_est` = 2nd derivative (the y variable)
+- `x_est` = level. Effect of `x_est` on `d2x_est` gives the cycling parameter (must be negative to be interpretable).
+- `dx_est` = 1st derivative. Effect of `dx_est` on `d2x_est` gives the damping parameter (if negative, this will produce damping. If positive, this will produce amplification)
+
+
+```{r modelbf, eval = F}
+# brms formula for female partner
+f_mod <- bf(d2x_est ~ 
+              0 + # model assumes oscillations occur around an equilibrium level, so we need to drop out the intercept. This is a no intercept model. 
+              
+              # fixed effects: female self-regulation parameters
+              x_est + dx_est + # female cycling and damping during female recipient support discussion (omitted category)
+              x_est:fr1 + dx_est:fr1 + # differences in female cycling and damping between female support discussion and control discussion
+              x_est:fr2 + dx_est:fr2 + # differences in female cycling and damping between female support discussion and male support discussion
+
+              
+             # fixed effects:  female cross-partner effects
+              
+              b.x_est + b.dx_est + # male partner's effect on female partner cycling and damping during female recipient support discussion (omitted category)
+              b.x_est:fr1 + b.dx_est:fr1 +  # differences in male partner's effect on female partner cycling and damping between female support discussion and control discussion
+              b.x_est:fr2 + b.dx_est:fr2 +  # differences in male partner's effect on female partner cycling and damping between female support discussion and male support discussion
+              
+              
+              # random effects: model all parameters as random (varying by dyad)
+              (0 + x_est + dx_est +
+                 x_est:fr1 + dx_est:fr1 +
+                 x_est:fr2 + dx_est:fr2 + 
+                 
+                 b.x_est + b.dx_est +
+                 b.x_est:fr1 + b.dx_est:fr1 + 
+                 b.x_est:fr2 + b.dx_est:fr2 |p| dyad))
+
+
+
+# brms formula for male partner (similar to set up for female partner above)
+# note that y variable is now b.d2x_est to reflect outcome for male partner.
+
+m_mod <- bf(b.d2x_est ~  0 + b.x_est + b.dx_est +
+              b.x_est:fr1 + b.dx_est:fr1 + 
+              b.x_est:fr2 + b.dx_est:fr2 + 
+              
+              x_est + dx_est +
+              x_est:fr1 + dx_est:fr1 +
+              x_est:fr2 + dx_est:fr2 +
+              
+              (0 + b.x_est + b.dx_est +
+                 b.x_est:fr1 + b.dx_est:fr1 + 
+                 b.x_est:fr2 + b.dx_est:fr2 + 
+                 
+                 x_est + dx_est +
+                 x_est:fr1 + dx_est:fr1 +
+                 x_est:fr2 + dx_est:fr2 |p| dyad))
+
+```
+
+## Define Priors
+
+- We set a uniform prior in the interval [-2, 2] for the fixed effects. This means we expect all fixed effect estimates to be somewhere between -2 and 2. This is a weak prior, but it nonetheless facilitates estimation because it greatly narrows the range of plausible values considered. 
+- The random effects take the default priors from brms, also defined below. 
+
+```{r coregpriors}
+
+Ps <- c(set_prior("uniform(-2, 2)", class = "b"),
+        set_prior("student_t(3, 0, 18)", class = "sd", 
+                  group = "dyad", resp = "bd2xest"),
+        set_prior("student_t(3, 0, 18)", class = "sd", 
+                  group = "dyad", resp = "d2xest"),
+        
+        set_prior("student_t(3, 0, 18)", class = "sigma", resp = "d2xest"),
+        set_prior("student_t(3, 0, 18)", class = "sigma", resp = "bd2xest"),
+        
+        set_prior("lkj(1)", class = "cor"),
+        set_prior("lkj(1)", class = "rescor"))
+        
+## All priors are defaults except for for class "b" priors (fixed effects), which have been changed to be uniform
+
+
+```
+
+## Fit Coupled Damped Linear Oscillator 
+-  $\color{red}{\text{NOTE: THIS MODEL WILL TAKE A LONG TIME TO RUN (~18-24 hours, depending on your computer)}}$
+- You can access the model object directly by loading the `.rds` file provided. This will essentially be as if you had run the model yourself, but without the wait time.
+- If you chose to run the model, we highly recommend saving the model object (see the `saveRDS()` code) so you can access the model object in a fresh R session without having to run the model again. 
+
+```{r cdlomodel, eval = F}
+
+# DO NOT RUN THIS CODE UNLESS YOU WANT TO RUN THE FULL MODEL YOURSELF. 
+# YOU CAN ACCESS THE RESULTING MODEL OBJECT THAT THIS CODE GENERATES IN THE NEXT CODE CHUNK.
+
+t1 <- Sys.time()
+fitnest_prior <- brm(f_mod + m_mod, 
+                     data = dsmdata_uns, 
+                     
+              # set a seed to ensure reproducibility 
+               seed = 111, 
+              
+              # provide an arbitrary starting value to facilitate estimation. this is especially useful in 0-intercept models. 
+              # details here: https://discourse.mc-stan.org/t/function-to-specify-initial-values-in-brms-model-has-dimension-mismatch/8692/3
+              init_r = .1, 
+              
+              # 8000 iterations per each of 4 chains. This is an increase from the default of 2000 iterations per each of 4 chains.
+              iter = 8000, 
+              
+              # tell brms to use the priors defined above.
+               prior = Ps, 
+              
+              # save all the parameters in model object
+               save_all_pars = T,
+              
+              # set max_treedepth to address efficiency issues
+              # details here: https://mc-stan.org/misc/warnings.html#maximum-treedepth-exceeded
+               control = list(max_treedepth = 15))
+t2 <- Sys.time()
+t2-t1
+# Time difference of 1.16216 days
+# saveRDS(fitnest_prior, "fitnest_prior_topost.rds")
+
+```
+
+### Load rds file containing the model object
+
+- To avoid having to run the model from scratch, which is very time consuming, we have provided a rendered `.rds` file, which contains the full model object. Loading this `.rds` file gives you the same output as if you had run the model yourself, but removes the wait time.
+
+- The `.rds` file is too large to upload to Github or OSF, but you can download it here: [https://drive.google.com/file/d/1iIU-GwLJXVAALvNz-QR2LD_sruu3-K-a/view](https://drive.google.com/file/d/1iIU-GwLJXVAALvNz-QR2LD_sruu3-K-a/view). **NOTE THIS IS A LARGE FILE (1.24 GB)**
+
+```{r cdlomodelobject, echo = T}
+
+fitnest_prior <- readRDS("fitnest_prior_topost.rds") # ensure the .rds file is saved to your local machine
+print(fitnest_prior, digits = 3)
+```
+
+## Define Parameters
+
+- Generate vectors with the model parameters.
+- As a reminder, parameters with the prefix `b` are for the male partner.
+
+```{r cdloparams}
+
+## Female support discussion parameter values (fixed effects)
+# use _0 to indicate coefficients for female partner (i.e., where female partner 2nd derivative is the outcome)
+# use _1 to indicate coefficients for female partner (i.e., where male partner 2nd derivative is the outcome)
+
+parsf_coupled_nest <- c(
+  obs_0 = fixef(fitnest_prior)["d2xest_x_est", "Estimate"],
+  d1_0 = fixef(fitnest_prior)["d2xest_dx_est", "Estimate"],
+  p_obs_0 = fixef(fitnest_prior)["d2xest_b.x_est", "Estimate"],
+  p_d1_0 = fixef(fitnest_prior)["d2xest_b.dx_est", "Estimate"],
+  
+  obs_1 = fixef(fitnest_prior)["bd2xest_b.x_est", "Estimate"],
+  d1_1 = fixef(fitnest_prior)["bd2xest_b.dx_est", "Estimate"],
+  p_obs_1 = fixef(fitnest_prior)["bd2xest_x_est", "Estimate"],
+  p_d1_1 = fixef(fitnest_prior)["bd2xest_dx_est", "Estimate"]
+
+)
+
+## Male receive parameter values (fixed effects)
+
+parsf_coupled_malereceive_nest <- c(
+  obs_0 = fixef(fitnest_prior)["d2xest_x_est", "Estimate"] + fixef(fitnest_prior)["d2xest_x_est:fr2", "Estimate"],
+  d1_0 = fixef(fitnest_prior)["d2xest_dx_est", "Estimate"] + fixef(fitnest_prior)["d2xest_dx_est:fr2", "Estimate"],
+  p_obs_0 = fixef(fitnest_prior)["d2xest_b.x_est", "Estimate"] + fixef(fitnest_prior)["d2xest_b.x_est:fr2", "Estimate"],
+  p_d1_0 = fixef(fitnest_prior)["d2xest_b.dx_est", "Estimate"] + fixef(fitnest_prior)["d2xest_b.dx_est:fr2", "Estimate"],
+  
+  obs_1 = fixef(fitnest_prior)["bd2xest_b.x_est", "Estimate"] + fixef(fitnest_prior)["bd2xest_b.x_est:fr2", "Estimate"],
+  d1_1 = fixef(fitnest_prior)["bd2xest_b.dx_est", "Estimate"] + fixef(fitnest_prior)["bd2xest_b.dx_est:fr2", "Estimate"],
+  p_obs_1 = fixef(fitnest_prior)["bd2xest_x_est", "Estimate"] + fixef(fitnest_prior)["bd2xest_x_est:fr2", "Estimate"],
+  p_d1_1 = fixef(fitnest_prior)["bd2xest_dx_est", "Estimate"] + fixef(fitnest_prior)["bd2xest_dx_est:fr2", "Estimate"]
+
+)
+
+
+
+## Control discussion parameter values (fixed effects)
+
+parsf_coupled_goal_nest <- c(
+  obs_0 = fixef(fitnest_prior)["d2xest_x_est", "Estimate"] + fixef(fitnest_prior)["d2xest_x_est:fr1", "Estimate"],
+  d1_0 = fixef(fitnest_prior)["d2xest_dx_est", "Estimate"] + fixef(fitnest_prior)["d2xest_dx_est:fr1", "Estimate"],
+  p_obs_0 = fixef(fitnest_prior)["d2xest_b.x_est", "Estimate"] + fixef(fitnest_prior)["d2xest_b.x_est:fr1", "Estimate"],
+  
+  p_d1_0 = fixef(fitnest_prior)["d2xest_b.dx_est", "Estimate"] + fixef(fitnest_prior)["d2xest_b.dx_est:fr1", "Estimate"],
+  
+  obs_1 = fixef(fitnest_prior)["bd2xest_b.x_est", "Estimate"] + fixef(fitnest_prior)["bd2xest_b.x_est:fr1", "Estimate"],
+  d1_1 = fixef(fitnest_prior)["bd2xest_b.dx_est", "Estimate"] + fixef(fitnest_prior)["bd2xest_b.dx_est:fr1", "Estimate"],
+p_obs_1 = fixef(fitnest_prior)["bd2xest_x_est", "Estimate"] + fixef(fitnest_prior)["bd2xest_x_est:fr1", "Estimate"],
+
+  p_d1_1 = fixef(fitnest_prior)["bd2xest_dx_est", "Estimate"] + fixef(fitnest_prior)["bd2xest_dx_est:fr1", "Estimate"]
+  
+)
+
+
+
+```
+
+
+## Summary of Parameter values
+
+```{r paramsummary}
+
+pars_all <- data.frame(pars = names(parsf_coupled_nest), parsf_coupled_nest, parsf_coupled_malereceive_nest, parsf_coupled_goal_nest) %>% as.data.frame(.) %>% 
+  mutate_if(is.numeric, funs(roundto3))
+pars_all
+```
+
+
+## Start Values
+
+```{r startvaluesibi}
+
+# Select mean of first timepoint (raw IBI values) for each discussion by partner
+
+## Female receive discussion
+female_femalereceive_start <- mean(subset(kz, phase == "femalereceive" & partner== "A" & timephase.r == 0)$ibi.basec, na.rm = T)
+male_femalereceive_start <- mean(subset(kz, phase == "femalereceive" & partner== "B" & timephase.r == 0)$ibi.basec, na.rm = T)
+
+initvalues_fit_femalerec <- c(y1 = female_femalereceive_start, y2 = 0, y3 = male_femalereceive_start, y4 = 0)
+
+
+
+## Male receive discussion
+female_malereceive_start <- mean(subset(kz, phase == "malereceive" & partner== "A" & timephase.r == 0)$ibi.basec, na.rm = T)
+male_malereceive_start <- mean(subset(kz, phase == "malereceive" & partner== "B" & timephase.r == 0)$ibi.basec, na.rm = T)
+
+initvalues_fit_malerec <- c(y1 = female_malereceive_start, y2 = 0, y3 = male_malereceive_start, y4 = 0)
+
+
+
+
+## Control discussion
+female_goal_start <- mean(subset(kz, phase == "goal" & partner== "A" & timephase.r == 0)$ibi.basec, na.rm = T)
+male_goal_start <- mean(subset(kz, phase == "goal" & partner== "B" & timephase.r == 0)$ibi.basec, na.rm = T)
+
+initvalues_fit_goal <- c(y1 = female_goal_start, y2 = 0, y3 = male_goal_start, y4 = 0)
+
+```
+
+## Times
+
+- Define time within the observed range (30 timepoints, amounting to 5 min)
+
+```{r timerange}
+times_fit <- seq(from=0, to=29, by = .01)
+```
+
+## Generate Model Predictions
+- Generate predictions using start values, time range, function, and parameter values.
+
+```{r cdlopredictions}
+
+# Female receive discussion
+out_femalereceive_nest <- ode(y = initvalues_fit_femalerec, times = times_fit, func = cloCoupledOde, parms = parsf_coupled_nest)
+
+# Male receive discussion
+out_malereceive_nest <- ode(y = initvalues_fit_malerec, times = times_fit, func = cloCoupledOde, parms = parsf_coupled_malereceive_nest)
+
+# control discussion
+out_goal_nest <- ode(y = initvalues_fit_goal, times = times_fit, func = cloCoupledOde, parms = parsf_coupled_goal_nest)
+
+```
+
+
+
+# Plot Predictions 
+
+## Plots within 5 minute range
+
+```{r cdloplots, eval = T}
+x <- ("Time\n(in 10-second intervals)\n") 
+y <- ("\nInter-beat Interval (IBI)\n <-- Faster heart rate     Slower heart rate -->\n") 
+
+ylim <- c(-80, 85)
+xlim <- c(0, 30.5)
+
+newbreaks <- c(0, 29)
+newlabs <- c(0, 5)
+
+
+## Aggregate predictions
+plotdf_nest <-rbind(
+  as.data.frame(out_femalereceive_nest) %>% mutate(phase = "F Receives Support"),
+  as.data.frame(out_malereceive_nest) %>% mutate(phase = "M Receives Support"),
+  as.data.frame(out_goal_nest) %>% mutate(phase = "Control"))
+
+
+## Plot predictions
+allplots_nest <- ggplot(data = plotdf_nest, aes(x = time)) + 
+  geom_line(aes(y=y1), color="red", size=2) + # red = female partner (y1)
+  geom_line(aes(y=y3), color="blue", size=2) + # blue = male partner (y3)
+  ylab(y) +
+  geom_hline(yintercept = 0) +
+  facet_wrap(~phase, nrow = 1) +
+  theme_bw() + 
+  theme(text=element_text(size=12)) + 
+  xlab("Time") +
+  scale_x_continuous(breaks=newbreaks, labels = newlabs)
+allplots_nest
+
+```
+
+## Plots within longer time range (15 min)
+
+
+```{r plotlonger, eval = T}
+
+## Generate longer time sequence, up to 15 min (90 timepoints)
+times_fit2 <- seq(from=0, to=89, by = .01)
+
+
+## Generate predictions based on longer time sequence
+
+### Female receive
+out_femalereceive_nest_longer <- ode(y = initvalues_fit_femalerec, times = times_fit2, func = cloCoupledOde, parms = parsf_coupled_nest)
+
+### Male receive
+out_malereceive_nest_longer <- ode(y = initvalues_fit_malerec, times = times_fit2, func = cloCoupledOde, parms = parsf_coupled_malereceive_nest)
+
+### Control
+out_goal_nest_longer <- ode(y = initvalues_fit_goal, times = times_fit2, func = cloCoupledOde, parms = parsf_coupled_goal_nest)
+
+
+## Aggregate predicted values
+
+plotdf_nest_longer <-rbind(
+  as.data.frame(out_femalereceive_nest_longer) %>% mutate(phase = "F Receives Support"),
+  as.data.frame(out_malereceive_nest_longer) %>% mutate(phase = "M Receives Support"),
+  as.data.frame(out_goal_nest_longer) %>% mutate(phase = "Control"))
+
+
+
+## Plot predictions
+newbreaks2 <- c(0, 29, 59, 89)
+newlabs2 <- c(0, 5, 10, 15)
+
+allplots_nest_longer <- ggplot(data = plotdf_nest_longer, aes(x = time)) + 
+  geom_line(aes(y=y1), color="deeppink3", size=1, alpha = .7) +
+  geom_line(aes(y=y3), color="dodgerblue2", size=1, alpha = .7) +
+  geom_line(data = plotdf_nest, aes(y=y1),  color="red", size=1.3) +
+  geom_line(data = plotdf_nest, aes(y=y3),  color="blue", size=1.3) +
+  ylab(y) +
+  geom_hline(yintercept = 0) +
+  geom_vline(xintercept = 30, color = "gray50", size = .5, alpha = .7) + 
+  facet_wrap(~phase, nrow = 1) +
+  theme(strip.text.x = element_text(size = 12)) + 
+  theme_bw() + xlab("Time") +
+  scale_x_continuous(breaks=newbreaks2, labels = newlabs2)
+allplots_nest_longer
+```
+
+
+# Example Plots: Coregulation vs. Codysregulation
+
+```{r coreg_vs_dysreg}
+
+# define example parameter values for cycling, dampling, and partner effects
+
+coreg_example <- c(
+  obs_0 = -.28,
+  d1_0 = -.06,
+  p_obs_0 = -.02,
+  p_d1_0 = -.04, 
+  
+  obs_1 = -.25,
+  d1_1 = -.07,
+  p_obs_1 = -.03,
+  p_d1_1 = -.05)
+
+
+# define example parameter values for cycling, dampling, and partner effects
+
+dysreg_example <- c(
+  obs_0 = -.28,
+  d1_0 = .05,
+  p_obs_0 = -.02,
+  p_d1_0 = .03, 
+  
+  obs_1 = -.25,
+  d1_1 = .04,
+  p_obs_1 = .03,
+  p_d1_1 = .02)
+
+initvalues_support <- c(y1 = -30, y2 = 0, y3 = -50, y4 = 0)
+
+
+coreg_example_ode <- ode(y = initvalues_support, times = times_fit, func = cloCoupledOde, parms = coreg_example)
+dysreg_example_ode <- ode(y = initvalues_support, times = times_fit, func = cloCoupledOde, parms = dysreg_example)
+
+
+########### plot predictions ########### 
+
+coreg_example_plotdf <-rbind(
+  as.data.frame(coreg_example_ode) %>% mutate(phase = "Coregulation Example"),
+  as.data.frame(dysreg_example_ode) %>% mutate(phase = "Codysregulation Example"))
+
+
+
+coreg_example_plotdf$phase <- factor(coreg_example_plotdf$phase,
+                                     levels = c("Coregulation Example", "Codysregulation Example"))
+coreg_example_plot <- ggplot(data = coreg_example_plotdf, aes(x = time)) + 
+  geom_line(aes(y=y1), color="black", size=2) +
+  geom_line(aes(y=y3), color="gray50", size=2) +
+  xlab("\nTime") + 
+  ylab("Emotional Response\n") +
+  geom_hline(yintercept = 0) +
+  facet_wrap(~phase, nrow = 1) +
+  theme(strip.text.x = element_text(size = 12)) + 
+  theme_bw() + 
+  theme(text=element_text(size=12)) + 
+  theme(legend.position="none") +
+  # theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  scale_x_continuous(breaks=c(0, 30), labels = c()) +
+  scale_y_continuous(breaks=c(), labels = c())
+coreg_example_plot
+```
+
+# Tests on posterior samples
+
+## Pull out all posterior samples
+
+```{r cdlopostsamples}
+
+rcc_ps <- posterior_samples(fitnest_prior)
+```
+
+```{r cdlopostsamples2, eval = T}
+
+rcc_ps_sds <- dplyr::select(rcc_ps, contains("sd_")) # select only the posterior samples corresponding to the random (dyad specific effects), indicated by the prefix "sd_"
+
+
+# note that rcc_ps gives the random effects for the original model (fitnest_prior), which was estimated with the female recipients' support discussion as the reference category.
+
+# To get the posterior samples for the random effects in the other phases, we will load other version of the model that were run and fit with the other discussions as the reference catetory.
+
+fitnest_prior_goal <- readRDS("/Users/zeekatherine/Desktop/R Files/Couples_Physio/fitnest_prior_goal.rds")
+rcc_ps_goal <- posterior_samples(fitnest_prior_goal) # extract posterior samples
+rcc_ps_goal_sds <- dplyr::select(rcc_ps_goal, contains("sd_")) # select only the posterior samples corresponding to the random (dyad specific effects), indicated by the prefix "sd_"
+
+fitnest_prior_mr <- readRDS("/Users/zeekatherine/Desktop/R Files/Couples_Physio/fitnest_prior_mr.rds")
+rcc_ps_mr <- posterior_samples(fitnest_prior_mr) # extract posterior samples
+rcc_ps_mr_sds <- dplyr::select(rcc_ps_mr, contains("sd_")) # select only the posterior samples corresponding to the random (dyad specific effects), indicated by the prefix "sd_"
+
+
+
+```
+
+
+## Subset to posterior samples for fixed effects only
+
+```{r cdlopostsamples3}
+
+# from the broader dataframe containing the bayesian posterior samples, 
+# pull out just the ones that correspond to the fixed effects. 
+
+rcc_ps2 <- dplyr::select(rcc_ps, -contains("_dyad__"), -contains("prior_")) %>% 
+  
+  # generate new variables that are renamed in a more intuitive way
+  # the structure is: discussion_partner_parameter (e.g., fr_f_selfeta is the parameter during the female support discussion for the female partner's self-reg cycling effect [eta])
+  mutate(
+    
+    fr_f_selfeta = b_d2xest_x_est ,
+    fr_f_selfzeta = b_d2xest_dx_est,
+    
+    fr_f_peta = b_d2xest_b.x_est,
+    fr_f_pzeta = b_d2xest_b.dx_est ,
+
+    fr_m_selfeta = b_bd2xest_b.x_est ,
+    fr_m_selfzeta = b_bd2xest_b.dx_est,
+    
+    fr_m_peta = b_bd2xest_x_est ,
+    fr_m_pzeta = b_bd2xest_dx_est ,    
+    
+    
+    # generate vectors of posterior samples containing the posterior samples corresponding to estimates for each phase.
+    # because female support recipient discussion is the baseline category, to get a vector for posterior samples for the other
+    # phases, we need to add the fixed effects for the coefficient of interest and how it differs in the relevant phase.
+    
+    # e.g., to get the female partner's self-reg cycling effect in the *goal* discussion, we need to take the posterior samples from equivalent effect
+    # in the reference category (female recipient support) and add to them the posterior samples for the *difference* between female recipient support and goal discussions.
+    
+    # repeat same procedure for all parameters and all remaining discussions. 
+    
+    goal_f_selfeta = b_d2xest_x_est + `b_d2xest_x_est:fr1`,
+    goal_f_selfzeta = b_d2xest_dx_est + `b_d2xest_dx_est:fr1`,
+    
+    goal_f_peta = b_d2xest_b.x_est + `b_d2xest_b.x_est:fr1`,
+    goal_f_pzeta = b_d2xest_b.dx_est + `b_d2xest_b.dx_est:fr1`,
+    
+    
+    goal_m_selfeta = b_bd2xest_b.x_est + `b_bd2xest_b.x_est:fr1`,
+    goal_m_selfzeta = b_bd2xest_b.dx_est + `b_bd2xest_b.dx_est:fr1`,
+    
+    goal_m_peta = b_bd2xest_x_est + `b_bd2xest_x_est:fr1`,
+    goal_m_pzeta = b_bd2xest_dx_est + `b_bd2xest_dx_est:fr1`,
+    
+    mr_f_selfeta = b_d2xest_x_est + `b_d2xest_x_est:fr2`,
+    mr_f_selfzeta = b_d2xest_dx_est + `b_d2xest_dx_est:fr2`,
+    
+    mr_f_peta = b_d2xest_b.x_est + `b_d2xest_b.x_est:fr2`,
+    mr_f_pzeta = b_d2xest_b.dx_est + `b_d2xest_b.dx_est:fr2`,
+    
+    
+    mr_m_selfeta = b_bd2xest_b.x_est + `b_bd2xest_b.x_est:fr2`,
+    mr_m_selfzeta = b_bd2xest_b.dx_est + `b_bd2xest_b.dx_est:fr2`,
+    
+    mr_m_peta = b_bd2xest_x_est + `b_bd2xest_x_est:fr2`,
+    mr_m_pzeta = b_bd2xest_dx_est + `b_bd2xest_dx_est:fr2`
+    
+  )
+
+```
+
+## At least 2/4 Zetas Below the Overall Damping Mean
+
+### Generate an overall mean damping effect across partners and discussions (12 total)
+
+```{r postzetas}
+
+
+library(data.table)
+
+zetas_all <- data.frame(pars = names(parsf_coupled_nest), parsf_coupled_nest, parsf_coupled_malereceive_nest, parsf_coupled_goal_nest) %>% as.data.frame(.) %>% 
+# generate data frame with all the fixed effect parameter values for each phase
+# then subset the dataframe to include only the damping parameters, given by the label "d1" ("obs" corresponds to level, which gives the cycling parameters)
+  
+subset(., pars %like% "d1") %>% pivot_longer(-pars,
+  names_to = "type",
+  values_to = "val")
+
+zeta_grand_mean <- mean(zetas_all$val)
+zeta_grand_mean # this is the mean damping value aggregating across all 12 damping parameter values
+```
+
+
+### Code if each posterior sample falls below grand mean
+
+```{r postzetas2}  
+
+# Based on procedures and code obtained described in:
+
+# - [https://statmodeling.stat.columbia.edu/2009/10/13/what_is_the_bay/](https://statmodeling.stat.columbia.edu/2009/10/13/what_is_the_bay/)
+
+# - [https://lingpipe-blog.com/2009/10/13/bayesian-counterpart-to-fisher-exact-test-on-contingency-tables/](https://lingpipe-blog.com/2009/10/13/bayesian-counterpart-to-fisher-exact-test-on-contingency-tables/)
+
+
+
+## Define helper function
+is_below <- function(zeta){
+ifelse(zeta < zeta_grand_mean, 1, 0)
+  }
+
+
+## Procedure: for each zeta parameter for each discussion,
+# code whether it is below the zeta grand mean (1) or not (0)
+# then add up the total number of parameters with zeta < zeta_grand_mean
+# the maximum possible is 4, the mininum possible is 0
+# next, create a binary variable whereby if the number of parameters
+# where zeta < zeta_grand_mean is 2 or more then TRUE, otherwise FALSE
+# repeat the procedure for each discussion phase
+
+
+## Female Receive
+fr_zetas_neg <- with(rcc_ps2, rowSums(cbind(
+  is_below(fr_f_selfzeta),
+  is_below(fr_f_pzeta),
+  is_below(fr_m_selfzeta),
+  is_below(fr_m_pzeta))))
+
+fr_zetas_2neg <- ifelse(fr_zetas_neg >= 2, TRUE, FALSE)
+
+
+# Male Receive
+mr_zetas_neg <- with(rcc_ps2, rowSums(cbind(
+  is_below(mr_f_selfzeta),
+  is_below(mr_f_pzeta),
+  is_below(mr_m_selfzeta),
+  is_below(mr_m_pzeta))))
+
+mr_zetas_2neg <- ifelse(mr_zetas_neg >= 2, TRUE, FALSE)
+
+
+
+goal_zetas_neg <- with(rcc_ps2, rowSums(cbind(
+  is_below(goal_f_selfzeta),
+  is_below(goal_f_pzeta),
+  is_below(goal_m_selfzeta),
+  is_below(goal_m_pzeta))))
+
+goal_zetas_2neg <- ifelse(goal_zetas_neg >= 2, TRUE, FALSE)
+
+
+
+
+## Take T/F distribution and convert to beta binomial distribution
+
+## Male Receive
+mr_n1_2neg = sum(table(mr_zetas_2neg)) 
+mr_y1_2neg = table(mr_zetas_2neg)["TRUE"]  
+
+
+## Female Receive
+fr_n2_2neg = sum(table(fr_zetas_2neg )) # 
+fr_y2_2neg = table(fr_zetas_2neg)["TRUE"]  # good coreg - female receive
+
+
+## Control
+goal_n3_2neg = sum(table(goal_zetas_2neg)) 
+goal_y3_2neg = table(goal_zetas_2neg)["TRUE"]  
+
+
+## Use simulation to convert to beta binomial
+I = 10000 # simulations
+set.seed(111)
+
+# male receive
+mr_theta1_2neg = rbeta(I, mr_y1_2neg+1, (mr_n1_2neg-mr_y1_2neg)+1) 
+quantile(mr_theta1_2neg, probs = c(.025, .975))
+
+# female receive
+fr_theta2_2neg = rbeta(I, fr_y2_2neg+1, (fr_n2_2neg-fr_y2_2neg)+1)
+quantile(fr_theta2_2neg, probs = c(.025, .975))
+
+# goal
+goal_thetagoal_2neg = rbeta(I, goal_y3_2neg+1, (goal_n3_2neg-goal_y3_2neg)+1)
+quantile(goal_thetagoal_2neg, probs = c(.025, .975))
+
+
+# Take the difference in distributions between the male and female recipient support discussions
+mr_minus_fr_diff_2neg = mr_theta1_2neg - fr_theta2_2neg  # simulated diffs
+quantile(mr_minus_fr_diff_2neg, probs = c(.025, .975))
+mean(mr_minus_fr_diff_2neg)
+
+
+## Aggregate data into one dataframe
+thetas_diffs_2neg <- rbind(
+  data.frame(theta = goal_thetagoal_2neg, type = "Control"),
+  data.frame(theta = fr_theta2_2neg, type = "F Receives Support"),
+  data.frame(theta = mr_theta1_2neg, type = "M Receives Support")) 
+
+
+
+
+## set quantile lwr and upr function to easily generate 95% CIs
+quantile_lwr <- function(x){
+  quantile(x, prob = .025)
+}
+
+quantile_upr <- function(x){
+  quantile(x, prob = .975)
+}
+
+
+## compute descriptives on probability distributions
+
+theta_mean <- tapply(thetas_diffs_2neg$theta, thetas_diffs_2neg$type, mean)
+theta_lwr <- tapply(thetas_diffs_2neg$theta, thetas_diffs_2neg$type, quantile_lwr)
+theta_upr <-tapply(thetas_diffs_2neg$theta, thetas_diffs_2neg$type, quantile_upr)
+
+
+theta_stats <- thetas_diffs_2neg %>% 
+  group_by(type) %>% 
+  summarise(
+    theta_lwr = quantile_lwr(theta),
+    theta_mean = mean(theta),
+    theta_upr = quantile_upr(theta)
+  )
+theta_stats
+```
+
+
+```{r zetdiffsupplot}
+
+# visualize difference in probabilities between the two support discussions
+
+diff_2neg.df <- as.data.frame(mr_minus_fr_diff_2neg)
+
+supdiffplot <- ggplot(diff_2neg.df, aes(x = mr_minus_fr_diff_2neg)) +
+  geom_density( alpha = .4, color = "ghostwhite", size = .0001, fill = "mediumpurple2") +
+    theme_bw() +
+  theme(strip.text.x = element_text(size = 12)) + 
+  theme(text=element_text(size=20)) + 
+  theme(legend.position="bottom") +
+  geom_point(aes(x = mean(mr_minus_fr_diff_2neg), y = 0), size = 2, color = "mediumpurple3") +
+  geom_segment(aes(x = quantile(mr_minus_fr_diff_2neg, probs = .025) , 
+                   y = 0, xend = quantile(mr_minus_fr_diff_2neg, probs = .975), yend = 0), size = 1, alpha = .7, color = "mediumpurple3") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+ xlab("\nDifference in Probability between Support Discussions") + 
+  ylab("Density") +
+  theme(text=element_text(size=12)) +
+  theme(strip.text = element_text(size = 12)) +
+  labs(fill='Discussion', color = 'Discussion') +
+  theme(legend.position="") +
+  theme(text=element_text(size=12)) +
+  theme(strip.text = element_text(size = 12)) +
+  xlim(-.025, .08) +
+  geom_vline(xintercept = 0, lty = "dotted", color = "gray60", size = .5) +
+  annotate(geom="text", x=-.015, y=4, label="<-- Higher Probability\nwhen F Receives", color="red", size=3, fontface = 'italic') +
+  annotate(geom="text", x=.015, y=4, label="Higher Probability -->\nwhen M Receives", color="blue", size=3, fontface = 'italic')
+supdiffplot
+# saveRDS(supdiffplot, "supdiffplot.rds")
+
+```
+
+
+### All Zetas below mean - sim trajectories
+
+- Generate an illustration of trajectories in which all dampling parameters fall above or below the grand mean of zeta
+
+```{r zetasimtrajectory}
+
+# full out the standard deviations for model parameters (from the random effects)
+ranefs_fitnest <- VarCorr(fitnest_prior)$dyad$sd
+
+all_below_mean <- c(
+  obs_0 = parsf_coupled_goal_nest["obs_0"] %>% as.numeric(), # keep cycling parameters the same as we got from the model 
+  d1_0 = as.numeric((parsf_coupled_goal_nest["d1_0"])-ranefs_fitnest["d2xest_dx_est", "Estimate"]), # have damping parameter fall 1 sd below the mean (leveraging random effects)
+  p_obs_0 = parsf_coupled_goal_nest["p_obs_0"] %>% as.numeric(), # keep cycling parameters the same as we got from the model 
+  p_d1_0 = (parsf_coupled_goal_nest["p_d1_0"]-ranefs_fitnest["d2xest_b.dx_est", "Estimate"]) %>% as.numeric(),   # have damping parameter fall 1 sd below the mean (leveraging random effects)
+  
+  obs_1 = parsf_coupled_goal_nest["obs_1"] %>% as.numeric(), # keep cycling parameters the same as we got from the model 
+  d1_1 = (parsf_coupled_goal_nest["d1_1"]-ranefs_fitnest["bd2xest_b.dx_est", "Estimate"])%>% as.numeric(),  # have damping parameter fall 1 sd below the mean (leveraging random effects)
+  p_obs_1 = parsf_coupled_goal_nest["p_obs_1"] %>% as.numeric(), # keep cycling parameters the same as we got from the model 
+  p_d1_1 = (parsf_coupled_goal_nest["p_d1_1"]-ranefs_fitnest["bd2xest_dx_est", "Estimate"]) %>% as.numeric())  # have damping parameter fall 1 sd below the mean (leveraging random effects)
+
+
+
+all_above_mean <- c(
+  obs_0 = parsf_coupled_goal_nest["obs_0"] %>% as.numeric(), # keep cycling parameters the same as we got from the model 
+  d1_0 = as.numeric((parsf_coupled_goal_nest["d1_0"])+ranefs_fitnest["d2xest_dx_est", "Estimate"]),  # have damping parameter fall 1 sd above the mean (leveraging random effects)
+  p_obs_0 = parsf_coupled_goal_nest["p_obs_0"] %>% as.numeric(), # keep cycling parameters the same as we got from the model 
+  p_d1_0 = (parsf_coupled_goal_nest["p_d1_0"]+ranefs_fitnest["d2xest_b.dx_est", "Estimate"]) %>% as.numeric(),   # have damping parameter fall 1 sd above the mean (leveraging random effects)
+  
+  obs_1 = parsf_coupled_goal_nest["obs_1"] %>% as.numeric(), # keep cycling parameters the same as we got from the model 
+  d1_1 = (parsf_coupled_goal_nest["d1_1"]+ranefs_fitnest["bd2xest_b.dx_est", "Estimate"])%>% as.numeric(),  # have damping parameter fall 1 sd above the mean (leveraging random effects)
+  p_obs_1 = parsf_coupled_goal_nest["p_obs_1"] %>% as.numeric(), # keep cycling parameters the same as we got from the model 
+  p_d1_1 = (parsf_coupled_goal_nest["p_d1_1"]+ranefs_fitnest["bd2xest_dx_est", "Estimate"]) %>% as.numeric())  # have damping parameter fall 1 sd above the mean (leveraging random effects)
+
+
+initvalues_support <- c(y1 = -30, y2 = 0, y3 = -50, y4 = 0) # define starting values for illustration
+initvalues_fit_femalerec
+initvalues_fit_goal
+initvalues_fit_malerec
+
+
+
+mean(c(initvalues_fit_femalerec["y1"], initvalues_fit_malerec["y1"], initvalues_fit_goal["y1"]))
+
+initvalues_sim1 <- c(
+  y1 = mean(c(initvalues_fit_femalerec["y1"], initvalues_fit_malerec["y1"], initvalues_fit_goal["y1"])),
+  y2 = 0,
+  y3 = mean(c(initvalues_fit_femalerec["y3"], initvalues_fit_malerec["y3"], initvalues_fit_goal["y3"])),
+  y4 = 0
+  )
+
+all_above_ode <- ode(y = initvalues_support, times = times_fit, func = cloCoupledOde, parms = all_above_mean)
+all_below_mean_ode <- ode(y = initvalues_support, times = times_fit, func = cloCoupledOde, parms = all_below_mean)
+
+
+########### plot predictions ########### 
+
+plotdf_compare_peta <-rbind(
+  as.data.frame(all_above_ode) %>% mutate(phase = "Damping Effects\nAbove Mean (+1 SD)"),
+  as.data.frame(all_below_mean_ode) %>% mutate(phase = "Damping Effects\n Below Mean (-1 SD)"))
+
+
+
+
+plot_zetas_below_above <- ggplot(data = plotdf_compare_peta, aes(x = time)) + 
+  geom_line(aes(y=y1), color="black", size=2) +
+  geom_line(aes(y=y3), color="gray50", size=2) +
+  xlab("Time") + 
+  ylab("Inter-beat Interval (IBI)") +
+  #ylim(ylim) + 
+  geom_hline(yintercept = 0) +
+  facet_wrap(~phase, nrow = 1) +
+  theme(strip.text.x = element_text(size = 12)) + 
+  theme_bw() + 
+  theme(text=element_text(size=12)) + 
+  theme(legend.position="none") +
+  scale_x_continuous(breaks=c(0, 30), labels = c(0,5))
+plot_zetas_below_above
+# saveRDS(plot_zetas_below_above, "plot_zetas_below_above.rds")
+```
+
+
+
+# Heterogeneity
+
+```{r coreghetero}
+
+####### Posterior Densities - Ratio of Fixed to Random ######
+# create a function that codes the percentage of posterior samples
+# where by the ratio of the random effect to its fixed effect is .25 or greater
+postprob_hetero <- function(posteriors, effect){
+  p <- posteriors
+  random_effect_name <- noquote(paste("sd_", "dyad__", effect, sep = ""))
+  fixed_effect_name <- noquote(paste("b_", effect, sep = ""))
+  random_post <- dplyr::select(p, random_effect_name)
+  fixed_post <- dplyr::select(p, fixed_effect_name)
+  post25 <- random_post / fixed_post
+  post25_mean <- mean(random_post[,1]) / mean(fixed_post[,1])
+  post25yes <- ifelse(abs(post25) > .25, 1, 0)
+  post.prob.25 <- table(post25yes)["1"]/sum(table(post25yes))
+  #return(round(post.prob.25, 2))
+  return(list(postprob = round(post.prob.25, 2),
+              ratio = round(abs(post25_mean), 2)))
+  
+}
+
+
+## Run function through a loop for each discussion phase
+
+## Female receive
+postprob_hetero_fr <- NULL
+for(i in row.names(fixef(fitnest_prior))){
+mydf <- data.frame(
+  ratio = postprob_hetero(rcc_ps, i)$ratio,
+  postprob_hetero = postprob_hetero(rcc_ps, i)$postprob)
+mydf$par = i
+postprob_hetero_fr <- rbind(postprob_hetero_fr, mydf)
+}
+postprob_hetero_fr %>% mutate(phase = "fr")
+
+
+## Male receive
+postprob_hetero_mr <- NULL
+for(i in row.names(fixef(fitnest_prior_mr))){
+  mydf <- data.frame(
+    ratio = postprob_hetero(rcc_ps_mr, i)$ratio,
+    postprob_hetero = postprob_hetero(rcc_ps_mr, i)$postprob)
+  mydf$par = i
+  postprob_hetero_mr <- rbind(postprob_hetero_mr, mydf)
+}
+postprob_hetero_mr %>% filter( str_detect(par,"mr2") == F) %>% mutate(phase = "mr")
+
+## Control (goal)
+postprob_hetero_goal <- NULL
+for(i in row.names(fixef(fitnest_prior_goal))){
+  mydf <- data.frame(
+    ratio = postprob_hetero(rcc_ps_goal, i)$ratio,
+    postprob_hetero = postprob_hetero(rcc_ps_goal, i)$postprob)
+  mydf$par = i
+  postprob_hetero_goal <- rbind(postprob_hetero_goal, mydf)
+}
+postprob_hetero_goal %>% filter( str_detect(par,"goal") == F) %>% mutate(phase = "goal")
+
+
+
+###  Aggregate output
+postprob_hetero_all <- rbind(
+  postprob_hetero_fr %>% mutate(phase = "fr"),
+postprob_hetero_mr %>% filter( str_detect(par,"mr2") == F) %>% mutate(phase = "mr"),
+postprob_hetero_goal %>% filter( str_detect(par,"goal") == F) %>% mutate(phase = "goal")
+)
+
+#write.csv(postprob_hetero_all, "postprob_hetero_all.csv", row.names = F)
+
+
+min(postprob_hetero_all$ratio)
+median(postprob_hetero_all$ratio)
+min(postprob_hetero_all$postprob_hetero)
+median(postprob_hetero_all$postprob_hetero)
+```
+
+
+## Heterogeneity Figure
+
+```{r coregheterofig, eval = T}
+
+#### parameter values ####
+# obtain dyad specific parameter values
+dyadcoefs <- as.data.frame(coef(fitnest_prior))
+dyadcoefs$dyad <- row.names(dyadcoefs)
+
+## 1) Generate loop that computes parameter values for each dyad
+
+## female receive
+femalerec_out <- NULL
+for (i in unique(fitnest_prior$data$dyad)) {
+  d <- subset(dyadcoefs, dyad == i)
+  
+  pars_femalerec <- data.frame(
+    obs_0 = d$dyad.Estimate.d2xest_x_est,
+    d1_0 = d$dyad.Estimate.d2xest_dx_est,
+    p_obs_0 = d$dyad.Estimate.d2xest_b.x_est,
+    p_d1_0 = d$dyad.Estimate.d2xest_b.dx_est,
+    
+    obs_1 = d$dyad.Estimate.bd2xest_b.x_est,
+    d1_1 = d$dyad.Estimate.bd2xest_b.dx_est,
+    p_obs_1 = d$dyad.Estimate.bd2xest_x_est,
+    p_d1_1 = d$dyad.Estimate.bd2xest_dx_est,
+    dyad = i,
+    phase = "female_rec")
+  femalerec_out <- rbind(femalerec_out, pars_femalerec)
+}
+
+
+## male receive
+
+malerec_out <- NULL
+for (i in unique(fitnest_prior$data$dyad)) {
+  d <- subset(dyadcoefs, dyad == i)
+  
+  pars_malerec <- data.frame(
+    obs_0 = d$dyad.Estimate.d2xest_x_est + d$dyad.Estimate.d2xest_x_est.fr2,
+    d1_0 = d$dyad.Estimate.d2xest_dx_est + d$dyad.Estimate.d2xest_dx_est.fr2,
+    p_obs_0 = d$dyad.Estimate.d2xest_b.x_est + d$dyad.Estimate.d2xest_b.x_est.fr2,
+    p_d1_0 = d$dyad.Estimate.d2xest_b.dx_est + d$dyad.Estimate.d2xest_b.dx_est.fr2,
+    
+    obs_1 = d$dyad.Estimate.bd2xest_b.x_est + d$dyad.Estimate.bd2xest_b.x_est.fr2,
+    d1_1 = d$dyad.Estimate.bd2xest_b.dx_est + d$dyad.Estimate.bd2xest_b.dx_est.fr2,
+    p_obs_1 = d$dyad.Estimate.bd2xest_x_est + d$dyad.Estimate.bd2xest_x_est.fr2,
+    p_d1_1 = d$dyad.Estimate.bd2xest_dx_est + d$dyad.Estimate.bd2xest_dx_est.fr2,
+    
+    dyad = i,
+    phase = "male_rec")
+  malerec_out <- rbind(malerec_out, pars_malerec)
+}
+
+
+## control
+
+goal_out <- NULL
+for (i in unique(fitnest_prior$data$dyad)) {
+  d <- subset(dyadcoefs, dyad == i)
+  
+  pars_goal <- data.frame(
+    obs_0 = d$dyad.Estimate.d2xest_x_est + d$dyad.Estimate.d2xest_x_est.fr1,
+    d1_0 = d$dyad.Estimate.d2xest_dx_est + d$dyad.Estimate.d2xest_dx_est.fr1,
+    p_obs_0 = d$dyad.Estimate.d2xest_b.x_est + d$dyad.Estimate.d2xest_b.x_est.fr1,
+    p_d1_0 = d$dyad.Estimate.d2xest_b.dx_est + d$dyad.Estimate.d2xest_b.dx_est.fr1,
+    
+    obs_1 = d$dyad.Estimate.bd2xest_b.x_est + d$dyad.Estimate.bd2xest_b.x_est.fr1,
+    d1_1 = d$dyad.Estimate.bd2xest_b.dx_est + d$dyad.Estimate.bd2xest_b.dx_est.fr1,
+    p_obs_1 = d$dyad.Estimate.bd2xest_x_est + d$dyad.Estimate.bd2xest_x_est.fr1,
+    p_d1_1 = d$dyad.Estimate.bd2xest_dx_est + d$dyad.Estimate.bd2xest_dx_est.fr1,
+    
+    dyad = i,
+    phase = "goal")
+  goal_out <- rbind(goal_out, pars_goal)
+}
+
+
+
+
+
+#### start values ####
+## 2) set up loop to get dyad-specific start values (initial raw IBI values)
+
+
+## female receive
+femalerec_start <- NULL
+for (i in unique(fitnest_prior$data$dyad)) {
+  d <- subset(kz, phase == "femalereceive" & timephase.r == 0 & dyad == i)
+  femalerec_start1 <- data.frame(
+    y1 = ifelse(is.na(mean(subset(d, partner == "A")$ibi.basec)) == T, mean(subset(kz, phase == "femalereceive" & partner== "A" & timephase.r == 0)$ibi.basec, na.rm = T),
+                mean(subset(d, partner == "A")$ibi.basec)),
+    y2 = 0,
+    y3 = ifelse(is.na(mean(subset(d, partner == "B")$ibi.basec)) == T, mean(subset(kz, phase == "femalereceive" & partner== "B" & timephase.r == 0)$ibi.basec, na.rm = T),
+                mean(subset(d, partner == "B")$ibi.basec)),
+    y4 = 0,
+    dyad = i)
+  femalerec_start <- rbind(femalerec_start, femalerec_start1)
+}
+
+
+
+## male receive
+malerec_start <- NULL
+for (i in unique(fitnest_prior$data$dyad)) {
+  d <- subset(kz, phase == "malereceive" & timephase.r == 0 & dyad == i)
+  malerec_start1 <- data.frame(
+    y1 = ifelse(is.na(mean(subset(d, partner == "A")$ibi.basec)) == T, mean(subset(kz, phase == "malereceive" & partner== "A" & timephase.r == 0)$ibi.basec, na.rm = T),
+                mean(subset(d, partner == "A")$ibi.basec)),
+    y2 = 0,
+    y3 = ifelse(is.na(mean(subset(d, partner == "B")$ibi.basec)) == T, mean(subset(kz, phase == "malereceive" & partner== "B" & timephase.r == 0)$ibi.basec, na.rm = T),
+                mean(subset(d, partner == "B")$ibi.basec)),
+    y4 = 0,
+    dyad = i)
+  malerec_start <- rbind(malerec_start, malerec_start1)
+}
+
+
+
+## control discussion
+goal_start <- NULL
+for (i in unique(fitnest_prior$data$dyad)) {
+  d <- subset(kz, phase == "goal" & timephase.r == 0 & dyad == i)
+  goal_start1 <- data.frame(
+    y1 = ifelse(is.na(mean(subset(d, partner == "A")$ibi.basec)) == T, mean(subset(kz, phase == "goal" & partner== "A" & timephase.r == 0)$ibi.basec, na.rm = T),
+                mean(subset(d, partner == "A")$ibi.basec)),
+    y2 = 0,
+    y3 = ifelse(is.na(mean(subset(d, partner == "B")$ibi.basec)) == T, mean(subset(kz, phase == "goal" & partner== "B" & timephase.r == 0)$ibi.basec, na.rm = T),
+                mean(subset(d, partner == "B")$ibi.basec)),
+    y4 = 0,
+    dyad = i)
+  goal_start <- rbind(goal_start, goal_start1)
+}
+
+
+
+
+
+###### generate predictions #####
+
+## 3) Set up loop to feed in dyad-specific start values and parameter values
+
+## female receive
+out_femalereceive_ranef <- NULL
+for (i in unique(fitnest_prior$data$dyad)) {
+  dyadstart <- c(y1 = subset(femalerec_start, dyad == i)$y1, y2 = subset(femalerec_start, dyad == i)$y2, 
+                 y3 = subset(femalerec_start, dyad == i)$y3, y4 = subset(femalerec_start, dyad == i)$y4)
+  outfr <- ode(y = dyadstart, times = times_fit, func = cloCoupledOde, parms = subset(femalerec_out, dyad == i))
+  df <- as.data.frame(outfr)
+  df$dyad <- i
+  out_femalereceive_ranef <- rbind(out_femalereceive_ranef, df)
+}
+
+
+## male receive
+out_malereceive_ranef <- NULL
+for (i in unique(fitnest_prior$data$dyad)) {
+  dyadstart <- c(y1 = subset(malerec_start, dyad == i)$y1, y2 = subset(malerec_start, dyad == i)$y2, 
+                 y3 = subset(malerec_start, dyad == i)$y3, y4 = subset(malerec_start, dyad == i)$y4)
+  outfr <- ode(y = dyadstart, times = times_fit, func = cloCoupledOde, parms = subset(malerec_out, dyad == i))
+  df <- as.data.frame(outfr)
+  df$dyad <- i
+  out_malereceive_ranef <- rbind(out_malereceive_ranef, df)
+}
+
+
+
+## control
+out_goal_ranef <- NULL
+for (i in unique(fitnest_prior$data$dyad)) {
+  dyadstart <- c(y1 = subset(goal_start, dyad == i)$y1, y2 = subset(goal_start, dyad == i)$y2, 
+                 y3 = subset(goal_start, dyad == i)$y3, y4 = subset(goal_start, dyad == i)$y4)
+  outfr <- ode(y = dyadstart, times = times_fit, func = cloCoupledOde, parms = subset(goal_out, dyad == i))
+  df <- as.data.frame(outfr)
+  df$dyad <- i
+  out_goal_ranef <- rbind(out_goal_ranef, df)
+}
+
+
+
+
+
+# 4) Aggregate resulting values into one dataframe
+
+all_ranefs <- rbind(
+  
+  out_femalereceive_ranef %>% mutate(phase = "fr"),
+  out_malereceive_ranef %>% mutate(phase = "mr"),
+  out_goal_ranef %>% mutate(phase = "goal")
+  
+)
+  
+
+
+
+
+# 5) Select a subset of dyads to plot (otherwise there will be several hundred plots)
+all_ranefs_sub <- subset(all_ranefs, dyad %in% c(513, 532, 655, 641, 694, 673)) # these are de-identified dyad numbers. 
+all_ranefs_sub$phase <- factor(all_ranefs_sub$phase,
+                               levels = c("goal", "fr", "mr"),
+                               labels = c("Control", "F Receives Support", "M Receives Support"))
+
+newdyad <- data.frame(dyad = unique(all_ranefs_sub$dyad),
+                      newdyad = c(1:length(unique(all_ranefs_sub$dyad))))
+newdyad$dyadlabel <- paste("Dyad", newdyad$newdyad, sep = " ")
+all_ranefs_sub <- merge(all_ranefs_sub, newdyad, by = "dyad")
+
+newbreaks <- c(0, 29)
+newlabs <- c(0, 5)
+
+
+
+# 6) Create panel plot
+hetero_panel <- ggplot(all_ranefs_sub, aes(x = time)) +
+  geom_line(aes(y=y3), color="blue", size=.6, alpha = .8) + 
+  geom_line(aes(y=y1), color="red", size=.6, alpha = .8) + 
+  geom_hline(yintercept = 0)+
+theme_bw() +   
+  geom_hline(yintercept = 0) + 
+  facet_grid(vars(dyadlabel),vars(phase), scales = "free_y") +
+  xlab("Time") +
+  ylab("IBI (person baseline centered)") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  scale_x_continuous(breaks=newbreaks, labels = newlabs) +
+  theme(strip.text.x = element_text(size = 12)) +
+  theme(strip.text.y = element_text(size = 12))
+hetero_panel
+
+
+```
+
+# Latent Profile Analysis
+
+```{r latentprofile1}
+
+# output just the random effects. Select columns containing "estimate", which are the coefficients
+
+fitranef <- as.data.frame(coef(fitnest_prior))
+fitranef_est <- dplyr::select(fitranef, contains("Estimate"))
+```
+
+```{r latentprofile2}
+
+# https://www.statmodel.com/download/Masyn_2013.pdf
+###### Latent Profile Analysis #####
+
+### use common start values across profiles ###
+
+model_definition_full <- mix(list(
+  dyad.Estimate.d2xest_x_est ~ 1,
+  dyad.Estimate.d2xest_dx_est ~ 1,
+  dyad.Estimate.d2xest_b.x_est  ~ 1,
+  dyad.Estimate.d2xest_b.dx_est      ~ 1 ,
+  
+  dyad.Estimate.d2xest_x_est.fr1     ~ 1,
+  dyad.Estimate.d2xest_dx_est.fr1    ~ 1,
+  
+  dyad.Estimate.d2xest_x_est.fr2     ~ 1,
+  dyad.Estimate.d2xest_dx_est.fr2    ~ 1,
+  
+  dyad.Estimate.d2xest_b.x_est.fr1   ~ 1,
+  dyad.Estimate.d2xest_b.dx_est.fr1  ~ 1,
+  
+  dyad.Estimate.d2xest_b.x_est.fr2   ~ 1,
+  dyad.Estimate.d2xest_b.dx_est.fr2  ~ 1,
+  
+  dyad.Estimate.bd2xest_b.x_est      ~ 1,
+  dyad.Estimate.bd2xest_b.dx_est     ~ 1,
+  dyad.Estimate.bd2xest_x_est        ~ 1,
+  dyad.Estimate.bd2xest_dx_est       ~ 1,
+  
+  dyad.Estimate.bd2xest_b.x_est.fr1  ~ 1,
+  dyad.Estimate.bd2xest_b.dx_est.fr1 ~ 1,
+  
+  dyad.Estimate.bd2xest_b.x_est.fr2  ~ 1,
+  dyad.Estimate.bd2xest_b.dx_est.fr2 ~ 1,
+ 
+  dyad.Estimate.bd2xest_x_est.fr1    ~ 1,
+  dyad.Estimate.bd2xest_dx_est.fr1   ~ 1,
+  
+  dyad.Estimate.bd2xest_x_est.fr2    ~ 1,
+  dyad.Estimate.bd2xest_dx_est.fr2 ~ 1
+  
+  
+  ),
+                        family = list(gaussian(), 
+                                     gaussian(),  
+                                     gaussian(),
+                                     gaussian(), 
+                                     gaussian(),  
+                                     gaussian(),
+                                     gaussian(), 
+                                     gaussian(),  
+                                     gaussian(),
+                                     gaussian(), 
+                                     gaussian(),  
+                                     gaussian(),
+                                     gaussian(), 
+                                     gaussian(),  
+                                     gaussian(),
+                                     gaussian(), 
+                                     gaussian(),  
+                                     gaussian(),
+                                     gaussian(), 
+                                     gaussian(),  
+                                     gaussian(),
+                                     gaussian(), 
+                                     gaussian(),  
+                                     gaussian()
+), # should be indicated in the list.
+                        data = fitranef_est,
+                        nstates = 3, #This is the number of classes
+                        nstart=c(1/3, 1/3, 1/3), # Prior probabilities of classes
+                        initdata = fitranef_est #Our data
+)
+set.seed(1111)
+fit.modfull <- fit(model_definition_full)
+fit.modfull %>% summary()
+BIC(fit.modfull)
+## Lowest BIC 
+
+
+
+fit.modfull.df <- data.frame(unclass(summary(fit.modfull)), 
+                     check.names = FALSE, stringsAsFactors = FALSE)
+fit.modfull.df <- dplyr::select(fit.modfull.df, contains("Intercept")) %>% 
+  mutate(class = row.names(.))
+
+
+
+## Female receive parameter values (fixed effects) for each of 3 profiles
+fit.modfull.df_st1 <- subset(fit.modfull.df, class == "St1")
+parsf_coupled_nest_st1 <- c(
+  obs_0 = fit.modfull.df_st1$`Re1.(Intercept)`,
+  d1_0 = fit.modfull.df_st1$`Re2.(Intercept)`,
+  p_obs_0 = fit.modfull.df_st1$`Re3.(Intercept)`,
+  p_d1_0 = fit.modfull.df_st1$`Re4.(Intercept)`,
+  
+  obs_1 = fit.modfull.df_st1$`Re13.(Intercept)`,
+  d1_1 = fit.modfull.df_st1$`Re14.(Intercept)`,
+  p_obs_1 = fit.modfull.df_st1$`Re15.(Intercept)`,
+  p_d1_1 = fit.modfull.df_st1$`Re16.(Intercept)`
+)
+
+
+fit.modfull.df_st2 <- subset(fit.modfull.df, class == "St2")
+parsf_coupled_nest_st2 <- c(
+  obs_0 = fit.modfull.df_st2$`Re1.(Intercept)`,
+  d1_0 = fit.modfull.df_st2$`Re2.(Intercept)`,
+  p_obs_0 = fit.modfull.df_st2$`Re3.(Intercept)`,
+  p_d1_0 = fit.modfull.df_st2$`Re4.(Intercept)`,
+  
+  obs_1 = fit.modfull.df_st2$`Re13.(Intercept)`,
+  d1_1 = fit.modfull.df_st2$`Re14.(Intercept)`,
+  p_obs_1 = fit.modfull.df_st2$`Re15.(Intercept)`,
+  p_d1_1 = fit.modfull.df_st2$`Re16.(Intercept)`
+)
+
+fit.modfull.df_st3 <- subset(fit.modfull.df, class == "St3")
+parsf_coupled_nest_st3 <- c(
+ obs_0 = fit.modfull.df_st3$`Re1.(Intercept)`,
+ d1_0 = fit.modfull.df_st3$`Re2.(Intercept)`,
+ p_obs_0 = fit.modfull.df_st3$`Re3.(Intercept)`,
+ p_d1_0 = fit.modfull.df_st3$`Re4.(Intercept)`,
+ 
+ obs_1 = fit.modfull.df_st3$`Re13.(Intercept)`,
+ d1_1 = fit.modfull.df_st3$`Re14.(Intercept)`,
+ p_obs_1 = fit.modfull.df_st3$`Re15.(Intercept)`,
+ p_d1_1 = fit.modfull.df_st3$`Re16.(Intercept)`
+ )
+
+
+## Male receive parameter values (fixed effects) - fr2 for each of 3 profiles
+parsf_coupled_nest_mr_st1 <- c(
+  obs_0 = fit.modfull.df_st1$`Re1.(Intercept)` + fit.modfull.df_st1$`Re7.(Intercept)`,
+  d1_0 = fit.modfull.df_st1$`Re2.(Intercept)` + fit.modfull.df_st1$`Re8.(Intercept)`,
+  p_obs_0 = fit.modfull.df_st1$`Re3.(Intercept)` + fit.modfull.df_st1$`Re11.(Intercept)`,
+  p_d1_0 = fit.modfull.df_st1$`Re4.(Intercept)` + fit.modfull.df_st1$`Re12.(Intercept)`,
+  
+  obs_1 = fit.modfull.df_st1$`Re13.(Intercept)` + fit.modfull.df_st1$`Re19.(Intercept)`,
+  d1_1 = fit.modfull.df_st1$`Re14.(Intercept)` + fit.modfull.df_st1$`Re20.(Intercept)`,
+  p_obs_1 = fit.modfull.df_st1$`Re15.(Intercept)` + fit.modfull.df_st1$`Re23.(Intercept)`,
+  p_d1_1 = fit.modfull.df_st1$`Re16.(Intercept)` + fit.modfull.df_st1$`Re24.(Intercept)`
+)
+
+
+parsf_coupled_nest_mr_st2 <- c(
+  obs_0 = fit.modfull.df_st2$`Re1.(Intercept)` + fit.modfull.df_st2$`Re7.(Intercept)`,
+  d1_0 = fit.modfull.df_st2$`Re2.(Intercept)` + fit.modfull.df_st2$`Re8.(Intercept)`,
+  p_obs_0 = fit.modfull.df_st2$`Re3.(Intercept)` + fit.modfull.df_st2$`Re11.(Intercept)`,
+  p_d1_0 = fit.modfull.df_st2$`Re4.(Intercept)` + fit.modfull.df_st2$`Re12.(Intercept)`,
+  
+  obs_1 = fit.modfull.df_st2$`Re13.(Intercept)` + fit.modfull.df_st2$`Re19.(Intercept)`,
+  d1_1 = fit.modfull.df_st2$`Re14.(Intercept)` + fit.modfull.df_st2$`Re20.(Intercept)`,
+  p_obs_1 = fit.modfull.df_st2$`Re15.(Intercept)` + fit.modfull.df_st2$`Re23.(Intercept)`,
+  p_d1_1 = fit.modfull.df_st2$`Re16.(Intercept)` + fit.modfull.df_st2$`Re24.(Intercept)`
+)
+
+
+ parsf_coupled_nest_mr_st3 <- c(
+   obs_0 = fit.modfull.df_st3$`Re1.(Intercept)` +  fit.modfull.df_st3$`Re7.(Intercept)`,
+   d1_0 = fit.modfull.df_st3$`Re2.(Intercept)` +  fit.modfull.df_st3$`Re8.(Intercept)`,
+   p_obs_0 = fit.modfull.df_st3$`Re3.(Intercept)` +  fit.modfull.df_st3$`Re11.(Intercept)`,
+   p_d1_0 = fit.modfull.df_st3$`Re4.(Intercept)` +  fit.modfull.df_st3$`Re12.(Intercept)`,
+   
+   obs_1 = fit.modfull.df_st3$`Re13.(Intercept)` +  fit.modfull.df_st3$`Re19.(Intercept)`,
+   d1_1 = fit.modfull.df_st3$`Re14.(Intercept)` +  fit.modfull.df_st3$`Re20.(Intercept)`,
+   p_obs_1 = fit.modfull.df_st3$`Re15.(Intercept)` +  fit.modfull.df_st3$`Re23.(Intercept)`,
+   p_d1_1 = fit.modfull.df_st3$`Re16.(Intercept)` +  fit.modfull.df_st3$`Re24.(Intercept)`
+ )
+
+
+## Control discussion parameter values (fixed effects) for each of 3 profiles
+which(colnames(fitranef_est) %like% colnames(fitranef_est)[15])
+
+
+parsf_coupled_nest_goal_st1 <- c(
+  obs_0 = fit.modfull.df_st1$`Re1.(Intercept)` + fit.modfull.df_st1[, 5],
+  d1_0 = fit.modfull.df_st1$`Re2.(Intercept)` + fit.modfull.df_st1[, 6],
+  p_obs_0 = fit.modfull.df_st1$`Re3.(Intercept)` + fit.modfull.df_st1[, 9],
+  p_d1_0 = fit.modfull.df_st1$`Re4.(Intercept)` + fit.modfull.df_st1[, 10],
+  
+  obs_1 = fit.modfull.df_st1$`Re13.(Intercept)` + fit.modfull.df_st1[, 17],
+  d1_1 = fit.modfull.df_st1$`Re14.(Intercept)` + fit.modfull.df_st1[, 18],
+  p_obs_1 = fit.modfull.df_st1$`Re15.(Intercept)` + fit.modfull.df_st1[, 21],
+  p_d1_1 = fit.modfull.df_st1$`Re16.(Intercept)` + + fit.modfull.df_st1[, 22]
+)
+
+
+
+parsf_coupled_nest_goal_st2 <- c(
+  obs_0 = fit.modfull.df_st2$`Re1.(Intercept)` + fit.modfull.df_st2[, 5],
+  d1_0 = fit.modfull.df_st2$`Re2.(Intercept)` + fit.modfull.df_st2[, 6],
+  p_obs_0 = fit.modfull.df_st2$`Re3.(Intercept)` + fit.modfull.df_st2[, 9],
+  p_d1_0 = fit.modfull.df_st2$`Re4.(Intercept)` + fit.modfull.df_st2[, 10],
+  
+  obs_1 = fit.modfull.df_st2$`Re13.(Intercept)` + fit.modfull.df_st2[, 17],
+  d1_1 = fit.modfull.df_st2$`Re14.(Intercept)` + fit.modfull.df_st2[, 18],
+  p_obs_1 = fit.modfull.df_st2$`Re15.(Intercept)` + fit.modfull.df_st2[, 21],
+  p_d1_1 = fit.modfull.df_st2$`Re16.(Intercept)` + + fit.modfull.df_st2[, 22]
+)
+
+
+
+ parsf_coupled_nest_goal_st3 <- c(
+   obs_0 = fit.modfull.df_st3$`Re1.(Intercept)` + fit.modfull.df_st3[, 5],
+   d1_0 = fit.modfull.df_st3$`Re2.(Intercept)` + fit.modfull.df_st3[, 6],
+   p_obs_0 = fit.modfull.df_st3$`Re3.(Intercept)` + fit.modfull.df_st3[, 9],
+   p_d1_0 = fit.modfull.df_st3$`Re4.(Intercept)` + fit.modfull.df_st3[, 10],
+   
+   obs_1 = fit.modfull.df_st3$`Re13.(Intercept)` + fit.modfull.df_st3[, 17],
+   d1_1 = fit.modfull.df_st3$`Re14.(Intercept)` + fit.modfull.df_st3[, 18],
+   p_obs_1 = fit.modfull.df_st3$`Re15.(Intercept)` + fit.modfull.df_st3[, 21],
+   p_d1_1 = fit.modfull.df_st3$`Re16.(Intercept)` + + fit.modfull.df_st3[, 22]
+ )
+
+
+
+out_fr_st1 <- ode(y = initvalues_fit_femalerec, 
+                                     times = times_fit2, func = cloCoupledOde, 
+                                     parms = parsf_coupled_nest_st1)
+out_fr_st2 <- ode(y = initvalues_fit_femalerec, 
+                  times = times_fit2, func = cloCoupledOde, 
+                  parms = parsf_coupled_nest_st2)
+ out_fr_st3 <- ode(y = initvalues_fit_femalerec, 
+                   times = times_fit2, func = cloCoupledOde, 
+                   parms = parsf_coupled_nest_st3)
+
+
+out_mr_st1 <- ode(y = initvalues_fit_malerec, 
+                  times = times_fit2, func = cloCoupledOde, 
+                  parms = parsf_coupled_nest_mr_st1)
+out_mr_st2 <- ode(y = initvalues_fit_malerec, 
+                  times = times_fit2, func = cloCoupledOde, 
+                  parms = parsf_coupled_nest_mr_st2)
+out_mr_st3 <- ode(y = initvalues_fit_malerec, 
+                  times = times_fit2, func = cloCoupledOde, 
+                  parms = parsf_coupled_nest_mr_st3)
+
+
+
+out_goal_st1 <- ode(y = initvalues_fit_goal, 
+                  times = times_fit2, func = cloCoupledOde, 
+                  parms = parsf_coupled_nest_goal_st1)
+out_goal_st2 <- ode(y = initvalues_fit_goal, 
+                  times = times_fit2, func = cloCoupledOde, 
+                  parms = parsf_coupled_nest_goal_st2)
+ out_goal_st3 <- ode(y = initvalues_fit_goal, 
+                   times = times_fit2, func = cloCoupledOde, 
+                   parms = parsf_coupled_nest_goal_st3)
+ 
+
+
+out_fit.mod <- rbind(
+  as.data.frame(out_fr_st1) %>% mutate(class = "Profile 1", phase = "F Receives"),
+  as.data.frame(out_fr_st2) %>% mutate(class = "Profile 2", phase = "F Receives"),
+  as.data.frame(out_fr_st3) %>% mutate(class = "Profile 3", phase = "F Receives"),
+  
+  as.data.frame(out_mr_st1) %>% mutate(class = "Profile 1", phase = "M Receives"),
+  as.data.frame(out_mr_st2) %>% mutate(class = "Profile 2", phase = "M Receives"),
+   as.data.frame(out_mr_st3) %>% mutate(class = "Profile 3", phase = "M Receives"),
+
+  as.data.frame(out_goal_st1) %>% mutate(class = "Profile 1", phase = "Control"),
+  as.data.frame(out_goal_st2) %>% mutate(class = "Profile 2", phase = "Control"),
+  as.data.frame(out_goal_st3) %>% mutate(class = "Profile 3", phase = "Control")
+  
+  )
+
+# Create panel plot
+latentprofile_panel_plot <- ggplot(out_fit.mod, aes(x = time)) +
+  geom_line(aes(y=y3), color = "blue",  size=1, alpha = .8) + 
+  geom_line(aes(y=y1), color = "red", size=1, alpha = .8) + 
+  geom_hline(yintercept = 0)+
+  geom_vline(xintercept = 30)+
+  theme_bw() +   
+  ylab(y) +
+  geom_hline(yintercept = 0) + 
+  facet_grid(vars(class), vars(phase), scales = "free_y") +
+  xlab("Time") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  scale_x_continuous(breaks=newbreaks2, labels = newlabs2) +
+  theme(text=element_text(size=12)) +
+  theme(strip.text = element_text(size = 12)) 
+  
+latentprofile_panel_plot
+
+```
+
+
+
+
+# NOTE: MODELS FROM HERE ON WILL NEED TO BE RUN (MODEL OBJECT NOT PRE-GENERATED)
+- Some rendered code is provided so you can see the output. 
+
+# Model Comparisons
+
+## Model without partner effects
+
+- Model is the same as above but without partner effects
+- NOTE: This model will take several hours to run. We provide code only for this and the remaining models, so you will need to run the model yourself to access the model object. 
+
+```{r nopartnerbf}
+
+
+f_mod_nop <- bf(d2x_est ~ 0 + x_est + dx_est +
+              x_est:fr1 + dx_est:fr1 +
+              x_est:fr2 + dx_est:fr2 +
+
+              (0 + x_est + dx_est +
+                 x_est:fr1 + dx_est:fr1 +
+                 x_est:fr2 + dx_est:fr2 |p| dyad))
+
+
+m_mod_nop <- bf(b.d2x_est ~  0 + b.x_est + b.dx_est +
+              b.x_est:fr1 + b.dx_est:fr1 + 
+              b.x_est:fr2 + b.dx_est:fr2 + 
+              
+              (0 + b.x_est + b.dx_est +
+                 b.x_est:fr1 + b.dx_est:fr1 + 
+                 b.x_est:fr2 + b.dx_est:fr2  |p| dyad))
+
+```
+
+
+```{r, eval = F}
+t1 <- Sys.time()
+fitnest_prior_nopartner <- brm(f_mod_nop + m_mod_nop, 
+                     data = dsmdata_uns, 
+               seed = 111, init_r = .1, iter = 8000, 
+               prior = Ps, 
+               save_all_pars = T,
+               control = list(max_treedepth = 15))
+t2 <- Sys.time()
+t2-t1
+# Time difference of  hours
+
+
+```
+
+
+## Plot results - Model without partner effects
+
+```{r plotlonger_nopartner_rds, eval = T, echo = F}
+fitnest_prior_nopartner <- readRDS("/Users/zeekatherine/Desktop/R Files/Couples_Physio/fitnest_prior_nopartner.rds")
+```
+
+```{r plotlonger_nopartner, eval = T}
+### plot with no partner
+
+## Female receive parameter values (fixed effects)
+parsf_coupled_nest_nop <- c(
+  obs_0 = fixef(fitnest_prior_nopartner)["d2xest_x_est", "Estimate"],
+  d1_0 = fixef(fitnest_prior_nopartner)["d2xest_dx_est", "Estimate"],
+
+  obs_1 = fixef(fitnest_prior_nopartner)["bd2xest_b.x_est", "Estimate"],
+  d1_1 = fixef(fitnest_prior_nopartner)["bd2xest_b.dx_est", "Estimate"]
+
+
+)
+
+## Male receive parameter values (fixed effects)
+
+parsf_coupled_malereceive_nest_nop <- c(
+  obs_0 = fixef(fitnest_prior_nopartner)["d2xest_x_est", "Estimate"] + fixef(fitnest_prior_nopartner)["d2xest_x_est:fr2", "Estimate"],
+  d1_0 = fixef(fitnest_prior_nopartner)["d2xest_dx_est", "Estimate"] + fixef(fitnest_prior_nopartner)["d2xest_dx_est:fr2", "Estimate"],
+
+  
+  obs_1 = fixef(fitnest_prior_nopartner)["bd2xest_b.x_est", "Estimate"] + fixef(fitnest_prior_nopartner)["bd2xest_b.x_est:fr2", "Estimate"],
+  d1_1 = fixef(fitnest_prior_nopartner)["bd2xest_b.dx_est", "Estimate"] + fixef(fitnest_prior_nopartner)["bd2xest_b.dx_est:fr2", "Estimate"]
+
+)
+
+
+
+## Control discussion parameter values (fixed effects)
+
+parsf_coupled_goal_nest_nop <- c(
+  obs_0 = fixef(fitnest_prior_nopartner)["d2xest_x_est", "Estimate"] + fixef(fitnest_prior_nopartner)["d2xest_x_est:fr1", "Estimate"],
+  d1_0 = fixef(fitnest_prior_nopartner)["d2xest_dx_est", "Estimate"] + fixef(fitnest_prior_nopartner)["d2xest_dx_est:fr1", "Estimate"],
+
+  obs_1 = fixef(fitnest_prior_nopartner)["bd2xest_b.x_est", "Estimate"] + fixef(fitnest_prior_nopartner)["bd2xest_b.x_est:fr1", "Estimate"],
+  d1_1 = fixef(fitnest_prior_nopartner)["bd2xest_b.dx_est", "Estimate"] + fixef(fitnest_prior_nopartner)["bd2xest_b.dx_est:fr1", "Estimate"]
+
+)
+
+
+
+### Update function to be univariate oscillator (no coupled part)
+loOde <- function(t, state, parameters)
+{
+  with(as.list(c(state, parameters)), {
+    dy1 <- y2
+    dy2 <- y1*obs_0 + y2*d1_0 
+    dy3 <- y4
+    dy4 <- y3*obs_1 + y4*d1_1
+    list(c(dy1, dy2, dy3, dy4))		
+  })
+}
+
+
+
+
+
+## Generate predictions based on longer time sequence
+
+### Female receive
+out_femalereceive_nest_longer_nop <- ode(y = initvalues_fit_femalerec, times = times_fit2, func = loOde, parms = parsf_coupled_nest_nop)
+
+### Male receive
+out_malereceive_nest_longer_nop <- ode(y = initvalues_fit_malerec, times = times_fit2, func = loOde, parms = parsf_coupled_malereceive_nest_nop)
+
+### Control
+out_goal_nest_longer_nop <- ode(y = initvalues_fit_goal, times = times_fit2, func = loOde, parms = parsf_coupled_goal_nest_nop)
+
+
+## Aggregate predicted values
+
+plotdf_nest_longer_nop <-rbind(
+  as.data.frame(out_femalereceive_nest_longer_nop) %>% mutate(phase = "F Receives Support"),
+  as.data.frame(out_malereceive_nest_longer_nop) %>% mutate(phase = "M Receives Support"),
+  as.data.frame(out_goal_nest_longer_nop) %>% mutate(phase = "Control"))
+
+### based on original 5 min ###
+### Female receive
+out_femalereceive_nest_longer_nop_shorter <- ode(y = initvalues_fit_femalerec, times = times_fit, func = loOde, parms = parsf_coupled_nest_nop)
+
+### Male receive
+out_malereceive_nest_longer_nop_shorter <- ode(y = initvalues_fit_malerec, times = times_fit, func = loOde, parms = parsf_coupled_malereceive_nest_nop)
+
+### Control
+out_goal_nest_longer_nop_shorter <- ode(y = initvalues_fit_goal, times = times_fit, func = loOde, parms = parsf_coupled_goal_nest_nop)
+
+
+## Aggregate predicted values
+
+plotdf_nest_longer_nop_shorter <-rbind(
+  as.data.frame(out_femalereceive_nest_longer_nop_shorter) %>% mutate(phase = "F Receives Support"),
+  as.data.frame(out_malereceive_nest_longer_nop_shorter) %>% mutate(phase = "M Receives Support"),
+  as.data.frame(out_goal_nest_longer_nop_shorter) %>% mutate(phase = "Control"))
+
+## Plot predictions
+newbreaks2 <- c(0, 29, 59, 89)
+newlabs2 <- c(0, 5, 10, 15)
+
+
+### swap labels to the left hand side
+plotdf_nest_longer_nop_bind <- rbind(plotdf_nest_longer_nop %>% mutate(model = "Predictions from Model\nWithout Partner Effects"), plotdf_nest_longer %>% mutate(model = "Predictions from Model\nWith Partner Effects"))
+
+
+plotdf_nest_longer_nop_bind_shorter <- rbind(plotdf_nest_longer_nop_shorter %>% mutate(model = "Predictions from Model\nWithout Partner Effects"), plotdf_nest %>% mutate(model = "Predictions from Model\nWith Partner Effects"))
+
+allplots_nest_longer_nop2 <- ggplot(data = plotdf_nest_longer_nop_bind, aes(x = time)) + 
+  geom_line(aes(y=y1), color="deeppink3", size=1, alpha = .7) +
+  geom_line(aes(y=y3), color="dodgerblue2", size=1, alpha = .7) +
+  geom_line(data = plotdf_nest_longer_nop_bind_shorter, aes(y=y1),  color="red", size=1.3) +
+  geom_line(data = plotdf_nest_longer_nop_bind_shorter, aes(y=y3),  color="blue", size=1.3) +
+  ylab(y) +
+  #ylim(ylim) + 
+  geom_hline(yintercept = 0) +
+  geom_vline(xintercept = 30, color = "gray50", size = .5, alpha = .7) + 
+  facet_grid(vars(model), vars(phase)) +
+  theme(strip.text.x = element_text(size = 12)) + 
+  theme_bw() + xlab("Time") +
+  scale_x_continuous(breaks=newbreaks2, labels = newlabs2)
+  # scale_y_continuous(position = "right")
+# allplots_nest_longer_nop2
+
+
+```
+
+
+
+## Model Comparison: Does model without partner effects fit data equally well as model with partner effects?
+
+- **NOTE: Running loo may take several hours**. 
+
+```{r nopartnerloo0, eval = F, echo = F}
+fitnest_prior_nopartner <- readRDS("/Users/zeekatherine/Desktop/R Files/Couples_Physio/fitnest_prior_nopartner.rds")
+
+```
+
+```{r nopartnerloo1, eval = F}
+
+
+loo_fitnest <- loo(fitnest_prior, fitnest_prior_nopartner)
+
+# Save resulting loo object as RDS
+saveRDS(loo_fitnest, "loo_fitnest.rds")
+
+
+# Model comparisons:
+#                         elpd_diff se_diff
+# fitnest_prior              0.0       0.0 
+# fitnest_prior_nopartner -521.0      38.2 
+
+
+# --> -521.0 *- 2 = 1042, 
+# 38.2 *2 = 76.4
+
+```
+
+```{r nopartnerloo2a, echo = F}
+
+# Load saved RDS loo object defined above. 
+
+loo_fitnest <- readRDS("/Users/zeekatherine/Desktop/R Files/Couples_Physio/loo_fitnest.rds")
+```
+
+```{r nopartnerloo2}
+
+loo_result <- as.data.frame(loo_fitnest$diffs)
+
+# To get loo diff estimates, we need to multiply elpd_diff by -2 and the corresponding standard error by 2.
+# https://discourse.mc-stan.org/t/where-did-loo-difference-estimates-go/8178/3
+
+
+loo_stat <- -2*loo_result$elpd_diff[2]
+loo_se <- 2*loo_result$se_diff[2]
+
+loo_z <- round((loo_stat/loo_se), 2)
+
+# In loo metric (yields same as above but without needing multiplication)
+loo_fitnest$ic_diffs__
+loo_fitnest$ic_diffs__[,1]/loo_fitnest$ic_diffs__[,2]
+```
+
+## Model without partner interaction effects
+
+- Same as original model, but does not allow PARTNER effects to differ by discussion
+
+```{r nointbf}
+
+f_mod_noparint <- bf(d2x_est ~ 0 + x_est + dx_est +
+              x_est:fr1 + dx_est:fr1 +
+              x_est:fr2 + dx_est:fr2 +
+              
+              b.x_est + b.dx_est + 
+              
+              (0 + x_est + dx_est +
+                 x_est:fr1 + dx_est:fr1 +
+                 x_est:fr2 + dx_est:fr2 + 
+                 
+                 b.x_est + b.dx_est |p| dyad))
+
+
+m_mod_noparint <- bf(b.d2x_est ~  0 + b.x_est + b.dx_est +
+              b.x_est:fr1 + b.dx_est:fr1 + 
+              b.x_est:fr2 + b.dx_est:fr2 + 
+              
+              x_est + dx_est +
+              
+              (0 + b.x_est + b.dx_est +
+                 b.x_est:fr1 + b.dx_est:fr1 + 
+                 b.x_est:fr2 + b.dx_est:fr2 + 
+                 
+                 x_est + dx_est |p| dyad))
+
+```
+
+```{r, eval = F}
+t1 <- Sys.time()
+fitnest_prior_noparint <- brm(f_mod_noparint + m_mod_noparint, 
+                     data = dsmdata_uns, 
+               seed = 111, init_r = .1, iter = 8000, 
+               prior = Ps, 
+              # save_all_pars = T,
+               control = list(max_treedepth = 15))
+t2 <- Sys.time()
+t2-t1
+# Time difference of 19.24786 hours
+
+
+
+
+loo_fitnest_noparint <- loo(fitnest_prior, fitnest_prior_noparint)
+```
+
+### Model Comparison: Does a model that includes partner effects but does not allow them to vary by discussion fit the data as well as the original model?
+```{r nointloo0, echo = F}
+loo_fitnest_noparint <- readRDS("/Users/zeekatherine/Desktop/R Files/Couples_Physio/loo_fitnest_noparint.rds")
+
+```
+
+```{r nointloo1}
+
+loo_noparint_result <- as.data.frame(loo_fitnest_noparint$diffs)
+
+# To get loo diff estimates, we need to multiply elpd_diff by -2 and the corresponding standard error by 2.
+# https://discourse.mc-stan.org/t/where-did-loo-difference-estimates-go/8178/3
+
+loo_noparint_stat <- -2*loo_noparint_result$elpd_diff[2]
+loo_noparint_se <- 2*loo_noparint_result$se_diff[2]
+
+loo_noparint_z <- round((loo_noparint_stat/loo_noparint_se), 2)
+
+# In loo metric (yields same as above but does not need multiplication)
+loo_fitnest_noparint$ic_diffs__
+loo_fitnest_noparint$ic_diffs__[,1]/loo_fitnest_noparint$ic_diffs__[,2] 
+
+round((loo_noparint_stat/loo_noparint_se), 2)
+```
+
+## Model with no interactions (constant effects across phases)
+
+- Similar to original model but imposes common effects across all discussion phases. 
+
+```{r nointloo2}
+
+f_mod_noint <- bf(d2x_est ~ 0 + x_est + dx_est +
+              b.x_est + b.dx_est +
+              (0 + x_est + dx_est +
+
+                 b.x_est + b.dx_est 
+               |p| dyad))
+
+
+m_mod_noint <- bf(b.d2x_est ~  0 + b.x_est + b.dx_est +
+                    
+              x_est + dx_est +
+              (0 + b.x_est + b.dx_est +
+                 x_est + dx_est 
+               |p| dyad))
+
+```
+
+```{r no_interaction_effects, eval = F}
+t1 <- Sys.time()
+fitnest_prior_noint <- brm(f_mod_noint + m_mod_noint,
+                           data = dsmdata_uns, 
+               seed = 111, 
+               init_r = .1, 
+               iter = 8000, 
+               control = list(max_treedepth = 15),
+               prior = Ps, 
+               save_all_pars = T,
+               )
+t2 <- Sys.time()
+t2-t1
+# Time difference of 
+```
+
+### Model Comparison: Does model that imposes constant effects across phases fit the data better than original model?
+
+```{r nointrunloo, eval = F}
+
+
+loo_fitnest_noint <- loo(fitnest_prior, fitnest_prior_noint)
+```
+
+```{r nointrunloo1, echo = F}
+loo_fitnest_noint <- readRDS("/Users/zeekatherine/Desktop/R Files/Couples_Physio/loo_fitnest_noint.rds")
+```
+
+```{r nointrunloo2}
+
+
+loo_noint_result <- as.data.frame(loo_fitnest_noint$diffs)
+
+loo_noint_stat <- -2*loo_noint_result$elpd_diff[2]
+loo_noint_se <- 2*loo_noint_result$se_diff[2]
+
+loo_noint_z <- round((loo_noint_stat/loo_noint_se), 2)
+
+# In loo metric
+loo_fitnest_noint$ic_diffs__
+loo_fitnest_noint$ic_diffs__[,1]/loo_fitnest_noint$ic_diffs__[,2] 
+
+round((loo_noint_stat/loo_noint_se), 2)
+```
+
+# Refitting Models Centered on other Discussions
+
+## Refit Model with Different Variable Coding for Discussion Phase - Goal
+
+```{r bfschangecenter}
+
+f_mod_goal <- bf(d2x_est ~ 0 + x_est + dx_est +
+              x_est:goal1 + dx_est:goal1 +
+              x_est:goal2 + dx_est:goal2 +
+              
+              b.x_est + b.dx_est +
+              b.x_est:goal1 + b.dx_est:goal1 + 
+              b.x_est:goal2 + b.dx_est:goal2 + 
+              
+              (0 + x_est + dx_est +
+                 x_est:goal1 + dx_est:goal1 +
+                 x_est:goal2 + dx_est:goal2 + 
+                 
+                 b.x_est + b.dx_est +
+                 b.x_est:goal1 + b.dx_est:goal1 + 
+                 b.x_est:goal2 + b.dx_est:goal2 |p| dyad))
+
+
+m_mod_goal <- bf(b.d2x_est ~  0 + b.x_est + b.dx_est +
+              b.x_est:goal1 + b.dx_est:goal1 + 
+              b.x_est:goal2 + b.dx_est:goal2 + 
+              
+              x_est + dx_est +
+              x_est:goal1 + dx_est:goal1 +
+              x_est:goal2 + dx_est:goal2 +
+              
+              (0 + b.x_est + b.dx_est +
+                 b.x_est:goal1 + b.dx_est:goal1 + 
+                 b.x_est:goal2 + b.dx_est:goal2 + 
+                 
+                 x_est + dx_est +
+                 x_est:goal1 + dx_est:goal1 +
+                 x_est:goal2 + dx_est:goal2 |p| dyad))
+
+```
+
+```{r with_goal_as_ref, eval = F}
+t1 <- Sys.time()
+fitnest_prior_goal <- brm(f_mod_goal + m_mod_goal, data = dsmdata_uns, 
+               seed = 111, 
+               init_r = .1, 
+               iter = 8000, 
+               control = list(max_treedepth = 15),
+               prior = Ps, sample_prior = T
+               )
+t2 <- Sys.time()
+t2-t1
+```
+
+## Refit Model with Different Variable Coding for Discussion Phase - male receive support
+
+```{r cdlomrcenter}
+
+f_mod_mr <- bf(d2x_est ~ 0 + x_est + dx_est +
+              x_est:mr1 + dx_est:mr1 +
+              x_est:mr2 + dx_est:mr2 +
+              
+              b.x_est + b.dx_est +
+              b.x_est:mr1 + b.dx_est:mr1 + 
+              b.x_est:mr2 + b.dx_est:mr2 + 
+              
+              (0 + x_est + dx_est +
+                 x_est:mr1 + dx_est:mr1 +
+                 x_est:mr2 + dx_est:mr2 + 
+                 
+                 b.x_est + b.dx_est +
+                 b.x_est:mr1 + b.dx_est:mr1 + 
+                 b.x_est:mr2 + b.dx_est:mr2 |p| dyad))
+
+
+m_mod_mr <- bf(b.d2x_est ~  0 + b.x_est + b.dx_est +
+              b.x_est:mr1 + b.dx_est:mr1 + 
+              b.x_est:mr2 + b.dx_est:mr2 + 
+              
+              x_est + dx_est +
+              x_est:mr1 + dx_est:mr1 +
+              x_est:mr2 + dx_est:mr2 +
+              
+              (0 + b.x_est + b.dx_est +
+                 b.x_est:mr1 + b.dx_est:mr1 + 
+                 b.x_est:mr2 + b.dx_est:mr2 + 
+                 
+                 x_est + dx_est +
+                 x_est:mr1 + dx_est:mr1 +
+                 x_est:mr2 + dx_est:mr2 |p| dyad))
+
+```
+
+```{r with_malereceive_as_ref, eval = F}
+t1 <- Sys.time()
+fitnest_prior_mr <- brm(f_mod_mr + m_mod_mr, data = dsmdata_uns, 
+               seed = 111, 
+               init_r = .1, 
+               iter = 8000, 
+               control = list(max_treedepth = 15),
+               prior = Ps, sample_prior = T
+               )
+t2 <- Sys.time()
+t2-t1
+```
+
+
+# IBI start values manipulation check
+
+- Test whether first IBI values during support discussions are lower (faster) than during control discussion
+
+```{r ibimanipcheck, eval = F}
+
+
+ibi_uns <- subset(dsmdata, partner == "A" & timephase.r == 0)
+
+f_ibi <- bf(ibi.basec ~ goal1 + goal2 + (1 |p| dyad))
+m_ibi <- bf(b.ibi.basec ~ goal1 + goal2 + (1 |p| dyad))
+
+mcheck_ibi <- brm(f_ibi + m_ibi, 
+                  data = ibi_uns,
+                  seed = 111)
+mcheck_ibi
+
+```
+
+
+```{r, echo = F}
+mcheck_ibi <- readRDS("/Users/zeekatherine/Desktop/R Files/Couples_Physio/fit_mcheck_ibi.rds")
+
+```
+
+```{r ibimanipcheck2}
+
+## Omitted Contrasts
+hypothesis(mcheck_ibi, "bibibasec_Intercept + bibibasec_goal2 = bibibasec_Intercept + bibibasec_goal1")
+ 
+ 
+hypothesis(mcheck_ibi, "ibibasec_Intercept + ibibasec_goal2 - ibibasec_Intercept + ibibasec_goal1 = 0")
+
+```
+
+
+```{r ibitimetrend, eval = F}
+# Time Trends with IBI
+# - On average, are there pronounced linear trends of time?
+
+
+# Rescale time to range from 0 to 1 so that time coefficient will capture 
+# overall change in IBI across the entire discussion period.
+phys_sub$timephase01 <- phys_sub$timephase.r/max(phys_sub$timephase.r)
+
+# change to effect coding to get the average time trend across all phases
+phys_sub$effect1 <- ifelse(phys_sub$phase == "goal", 2/3, -1/3)
+phys_sub$effect2 <- ifelse(phys_sub$phase == "malereceive", 2/3, -1/3)
+
+# One line per dyad for multivariate analysis
+phys_sub_uns <- subset(phys_sub, partner == "A")
+
+f_ibi <- bf(ibi ~ timephase01*effect1 + timephase01*effect2 + 
+                 (timephase01*effect1 + timephase01*effect2 | p | dyad))
+m_ibi <- bf(b.ibi ~ timephase01*effect1 + timephase01*effect2 + 
+                 (timephase01*effect1 + timephase01*effect2 | p | dyad))
+
+
+timeIBI <- brm(f_ibi + m_ibi, 
+               data = phys_sub_uns,
+               seed = 111, iter = 4000)
+
+
+```
+
+```{r, echo = F}
+timeIBI <- readRDS("/Users/zeekatherine/Desktop/R Files/Couples_Physio/timeIBI.rds")
+
+```
+
+```{r}
+hypothesis(timeIBI, "ibi_timephase01 + ibi_timephase01:effect1 = 0")
+hypothesis(timeIBI, "bibi_timephase01 + bibi_timephase01:effect1 = 0")
+hypothesis(timeIBI, "ibi_timephase01 + ibi_timephase01:effect2 = 0")
+hypothesis(timeIBI, "bibi_timephase01 + bibi_timephase01:effect2 = 0")
+
+```
+
+
+```{r ibitimetrend2}
+
+
+## Convert results from IBI metric to Heart Rate for ease of interpretation
+deltaHR_A <- (60000 / (fixef(timeIBI)["ibi_Intercept","Estimate"]+ fixef(timeIBI)["ibi_timephase01","Estimate"])) -  (60000 / (fixef(timeIBI)["ibi_Intercept","Estimate"]))
+deltaHR_A
+
+
+deltaHR_B <- (60000 / (fixef(timeIBI)["bibi_Intercept","Estimate"]+ fixef(timeIBI)["bibi_timephase01","Estimate"])) -  (60000 / (fixef(timeIBI)["bibi_Intercept","Estimate"]))
+deltaHR_B
+
+```
+
+
+
+
+# Pseudo dyads
+- Pseudo dyad pairing were created using original dyad ids.The attached file contains the pseudo-pairing with the new (de-identified) ID numbers. Dyad pairing were created using the `sample()` function in R, which pulls out a random partner ID (without replacement) for each person to create a new pseudo dyad. 
+
+- The data will need to be reshaped and joined to the derivatives dataset using the pseudo dyad pairings for the remaining code. 
+
+```{r}
+pseudo_pairings <- read.csv("zee_bolger_coreg_data_pseudodyads_deid.csv")
+# newdyad = a new dyad id number for the pseudo dyad pairings
+# deid_dyad_A = the de-identified dyad ID number for Partner A (i.e., the dyad to which partner A in the pseudo pairing belongs)
+# deid_dyad_B = the de-identified dyad ID number for Partner B (i.e., the dyad to which partner B in the pseudo pairing belongs)
+
+# the dataframe above will need to be used in conjunction with the dataframe above to reorganize the observations so that new pseudo dyad members are on same rows. 
+```
+
+
+```{r, eval = F}
+### Fit model #####
+
+
+# The same priors as the original model. 
+Psham <- c(set_prior("uniform(-2, 2)", class = "b"),
+        set_prior("student_t(3, 0, 18)", class = "sd", 
+                  group = "newdyad", resp = "bd2xest"),
+        set_prior("student_t(3, 0, 18)", class = "sd", 
+                  group = "newdyad", resp = "d2xest"),
+        
+        set_prior("student_t(3, 0, 18)", class = "sigma", resp = "d2xest"),
+        set_prior("student_t(3, 0, 18)", class = "sigma", resp = "bd2xest"),
+        
+        set_prior("lkj(1)", class = "cor"),
+        set_prior("lkj(1)", class = "rescor"))
+
+
+# define new brms formulas. the formulas are the same as in the original model
+# but with one important difference:
+# we will use `newdyad` as the grouping variable (to reflect pseudo pairings)
+# instead of `dyad`
+
+f_mod_sham <- bf(d2x_est ~ 0 + x_est + dx_est +
+              x_est:fr1 + dx_est:fr1 +
+              x_est:fr2 + dx_est:fr2 +
+              
+              b.x_est + b.dx_est +
+              b.x_est:fr1 + b.dx_est:fr1 + 
+              b.x_est:fr2 + b.dx_est:fr2 + 
+              
+              (0 + x_est + dx_est +
+                 x_est:fr1 + dx_est:fr1 +
+                 x_est:fr2 + dx_est:fr2 + 
+                 
+                 b.x_est + b.dx_est +
+                 b.x_est:fr1 + b.dx_est:fr1 + 
+                 b.x_est:fr2 + b.dx_est:fr2 |p| newdyad))
+
+
+m_mod_sham <- bf(b.d2x_est ~  0 + b.x_est + b.dx_est +
+              b.x_est:fr1 + b.dx_est:fr1 + 
+              b.x_est:fr2 + b.dx_est:fr2 + 
+              
+              x_est + dx_est +
+              x_est:fr1 + dx_est:fr1 +
+              x_est:fr2 + dx_est:fr2 +
+              
+              (0 + b.x_est + b.dx_est +
+                 b.x_est:fr1 + b.dx_est:fr1 + 
+                 b.x_est:fr2 + b.dx_est:fr2 + 
+                 
+                 x_est + dx_est +
+                 x_est:fr1 + dx_est:fr1 +
+                 x_est:fr2 + dx_est:fr2 |p| newdyad))
+
+t1 <- Sys.time()
+fitnest_prior_SHAM <- brm(f_mod_sham + m_mod_sham, 
+                     data = dsmdata_sham, # subs in the name of the dataframe that contains the pseudo dyad pairings 
+                     seed = 111, init_r = .1, iter = 8000, 
+                     prior = Psham, chains = 4,
+                     control = list(max_treedepth = 15))
+t2 <- Sys.time()
+t2-t1
+
+
+
+
+
+## compare to a model that removes partner effects
+f_mod_sham2 <- bf(d2x_est ~ 0 + x_est + dx_est +
+                   x_est:fr1 + dx_est:fr1 +
+                   x_est:fr2 + dx_est:fr2 +
+                   
+
+                   (0 + x_est + dx_est +
+                      x_est:fr1 + dx_est:fr1 +
+                      x_est:fr2 + dx_est:fr2  |p| newdyad))
+
+
+m_mod_sham2 <- bf(b.d2x_est ~  0 + b.x_est + b.dx_est +
+                   b.x_est:fr1 + b.dx_est:fr1 + 
+                   b.x_est:fr2 + b.dx_est:fr2 + 
+
+                   (0 + b.x_est + b.dx_est +
+                      b.x_est:fr1 + b.dx_est:fr1 + 
+                      b.x_est:fr2 + b.dx_est:fr2 |p| newdyad))
+
+ t1 <- Sys.time()
+ fitnest_prior_SHAMnopartner <- brm(f_mod_sham2 + m_mod_sham2, 
+                      data = dsmdata_sham, # subs in the name of the dataframe that contains the pseudo dyad pairings 
+                      seed = 111, init_r = .1, iter = 8000, 
+                      prior = Psham, chains = 4,
+                      control = list(max_treedepth = 15))
+ t2 <- Sys.time()
+ t2-t1
+
+```
+
+## Pseudo Dyads Model Comparisons
+
+- Compute improvement in model fit from the inclusion of partner effects for read vs. pseudodyads.
+
+```{r, eval = F}
+ shamloo <- loo(fitnest_prior_SHAM, fitnest_prior_SHAMnopartner)
+
+```
+
+```{r, echo = F}
+shamloo <- readRDS("/Users/zeekatherine/Desktop/R Files/Couples_Physio/shamloo.rds")
+```
+
+
+```{r shamdyad_loo, eval = F}
+
+shamloo_stat <- -2*shamloo$diffs[2, 1]
+shamloo_se <- 2*shamloo$diffs[2, 2]
+shamloo_z <- shamloo_stat/shamloo_se
+
+
+set.seed(111)
+diff_sham <-
+  tibble(diff = rnorm(n, 
+                      mean = shamloo_stat, 
+                      sd   = shamloo_se),
+         model = "sham")
+
+
+fitnestloo_shamloo_diff <- mean(diff$diff - diff_sham$diff)
+fitnestloo_shamloo_se <- sd(diff$diff - diff_sham$diff)
+ 
+fitnestloo_shamloo_ci <-quantile(diff$diff - diff_sham$diff,c(.025, .975))
+
+```
+
+
+
+
+# Session Info
+```{r}
+sessionInfo()
+```
+
